@@ -1,0 +1,24 @@
+[package]
+name = "puke"
+version = "0.1.0"
+description = "我和大模型玩扑克"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "puke_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "1.5", features = [] }
+
+[dependencies]
+tauri = { version = "1.6", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

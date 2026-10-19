@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+*.local
+
+# Tauri (Rust build artifacts)
+/src-tauri/target/
+/src-tauri/gen/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+Thumbs.db
+
+# Local project data (memory, local config)
+.workbuddy/
+
+# Env / secrets
+.env
+.env.*
+*.key
+*.pem
