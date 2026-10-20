@@ -67,7 +67,16 @@ export function shuffle<T>(arr: T[]): T[] {
   return a;
 }
 
-/** 斗地主手牌排序：点数大的在前，同点数按花色固定顺序 */
+/**
+ * 斗地主牌力值：3<4<…<J<Q<K<A<2<小王<大王。
+ * 卡面 rank 中 2 是 2、A 是 14，直接比 rank 会让「2 比 3 还小」，
+ * 因此斗地主相关的所有大小比较都必须走这个函数（2 提升为 15）。
+ */
+export function ddzValue(card: Card): number {
+  return card.rank === 2 ? 15 : card.rank;
+}
+
+/** 斗地主手牌排序：牌力大的在前（2 紧随 A 之后、王之前），同点数按花色固定顺序 */
 export function sortDdzCards(cards: Card[]): Card[] {
   const order: Record<Suit, number> = {
     spades: 0,
@@ -77,7 +86,9 @@ export function sortDdzCards(cards: Card[]): Card[] {
     joker: 4,
   };
   return [...cards].sort((a, b) => {
-    if (b.rank !== a.rank) return b.rank - a.rank;
+    const va = ddzValue(a);
+    const vb = ddzValue(b);
+    if (vb !== va) return vb - va;
     return order[a.suit] - order[b.suit];
   });
 }

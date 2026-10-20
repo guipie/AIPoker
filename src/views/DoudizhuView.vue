@@ -10,6 +10,7 @@ import {
   DoudizhuGame,
   canBeat,
   detectPattern,
+  findAllBeats,
   findBeats,
   suggestBid,
   suggestLead,
@@ -523,7 +524,10 @@ function resumeIfNeeded() {
 
 function applyState(next: any) {
   const prevPhase = state.value?.phase;
+  const prevLast = ((state.value?.lastPlay ?? []) as Card[]).map(c => c.id).join(",");
   state.value = next;
+  // 场上要压的牌变了 → 清掉上一轮的提示（下次点提示会按新形势重算）
+  if (prevLast !== ((next?.lastPlay ?? []) as Card[]).map(c => c.id).join(",")) resetHint();
   // 抢地主结束、正式开打的那一刻，快照各家手牌（含地主底牌），供复盘查看
   if (prevPhase === "bidding" && next.phase === "playing") {
     initialHands.value = next.players.map((p: any) => ({
@@ -553,6 +557,7 @@ function playSelected() {
   sfx.play();
   doPlay(0, ids, { source: "human" });
   selectedIds.value.clear();
+  resetHint();
   busy.value = false;
   driveBots();
 }
@@ -563,6 +568,7 @@ function pass() {
   sfx.fold();
   doPass(0, { source: "human" });
   selectedIds.value.clear();
+  resetHint();
   busy.value = false;
   driveBots();
 }
@@ -577,18 +583,75 @@ function bid(score: number) {
   driveBots();
 }
 
+// ===== 提示：循环切换所有能压过上家的牌组 =====
+const hintOptions = ref<Card[][]>([]);
+const hintIdx = ref(-1);
+const hintKey = ref("");
+const hintMsg = ref("");
+const hintEmpty = ref(false);
+
+/** 手牌或上家的牌发生变化时，提示候选需要重新计算 */
+function hintKeyOf() {
+  const lastIds = ((state.value?.lastPlay ?? []) as Card[]).map(c => c.id).join(",");
+  const handIds = ((me.value?.hand ?? []) as Card[]).map(c => c.id).join(",");
+  return `${lastIds}#${handIds}`;
+}
+
+function resetHint() {
+  hintOptions.value = [];
+  hintIdx.value = -1;
+  hintKey.value = "";
+  hintMsg.value = "";
+  hintEmpty.value = false;
+}
+
 function hint() {
   if (!isMyTurn.value || busy.value || !isPlaying.value) return;
-  const s = state.value;
-  const last = s.lastPlay ? detectPattern(s.lastPlay) : null;
-  let ids: string[] = [];
-  if (!last) {
-    ids = suggestLead(me.value.hand).map(c => c.id);
-  } else {
-    const beats = findBeats(me.value.hand, last);
-    ids = beats ? beats.map(c => c.id) : [];
+  const last = state.value.lastPlay ? detectPattern(state.value.lastPlay) : null;
+  const key = hintKeyOf();
+  if (key !== hintKey.value) {
+    hintOptions.value = findAllBeats((me.value?.hand ?? []) as Card[], last);
+    hintKey.value = key;
+    hintIdx.value = -1;
   }
-  selectedIds.value = new Set(ids);
+  if (hintOptions.value.length === 0) {
+    selectedIds.value = new Set();
+    hintEmpty.value = true;
+    hintMsg.value = last
+      ? `没有能压过 ${(state.value.lastPlay as Card[]).map(ddzLabel).join(" ")} 的牌，只能「不出」`
+      : "没有可出的牌";
+    sfx.fold();
+    return;
+  }
+  hintEmpty.value = false;
+  hintIdx.value = (hintIdx.value + 1) % hintOptions.value.length;
+  const opt = hintOptions.value[hintIdx.value];
+  selectedIds.value = new Set(opt.map(c => c.id));
+  const p = detectPattern(opt);
+  const tag =
+    p?.type === "rocket" ? "王炸" : p?.type === "bomb" ? "炸弹" : patternName(p?.type ?? "");
+  hintMsg.value = `第 ${hintIdx.value + 1}/${hintOptions.value.length} 个可选组合 · ${tag}`;
+  sfx.click();
+}
+
+function patternName(t: string) {
+  const m: Record<string, string> = {
+    single: "单张",
+    pair: "对子",
+    triple: "三张",
+    triple_single: "三带一",
+    triple_pair: "三带二",
+    straight: "顺子",
+    pair_straight: "连对",
+    airplane: "飞机",
+    airplane_single: "飞机带单",
+    airplane_pair: "飞机带对",
+    four_two_single: "四带二",
+    four_two_pair: "四带两对",
+    bomb: "炸弹",
+    rocket: "王炸",
+  };
+  return m[t] ?? "牌组";
 }
 
 function backToPlaza() {
@@ -792,9 +855,9 @@ onDeactivated(() => {
           </div>
 
           <div class="absolute inset-0 flex flex-col items-center justify-center gap-4">
-            <!-- 地主底牌 -->
+            <!-- 地主底牌：只在叫地主阶段展示，开打后收起（牌桌放不下） -->
             <div
-              v-if="state && state.landlordCards.length > 0"
+              v-if="isBidding && state && state.landlordCards.length > 0"
               class="flex flex-col items-center gap-1"
             >
               <span class="text-[11px] tracking-widest text-amber-200/70">地主底牌</span>
@@ -936,6 +999,15 @@ onDeactivated(() => {
         @toggle="toggleCard"
       />
 
+      <div class="mt-1.5 flex min-h-[18px] items-center justify-center">
+        <span
+          v-if="hintMsg"
+          class="rounded-full px-3 py-0.5 text-xs"
+          :class="hintEmpty ? 'bg-rose-500/20 text-rose-300' : 'bg-emerald-500/15 text-emerald-300'"
+        >
+          {{ hintMsg }}
+        </span>
+      </div>
       <div v-if="isPlaying" class="mt-2 flex justify-center gap-4">
         <button
           class="btn btn-primary px-7 py-2.5"
@@ -945,7 +1017,9 @@ onDeactivated(() => {
           出牌
         </button>
         <button class="btn btn-slate px-7 py-2.5" :disabled="!isMyTurn" @click="pass">不出</button>
-        <button class="btn btn-gold px-7 py-2.5" :disabled="!isMyTurn" @click="hint">提示</button>
+        <button class="btn btn-gold px-7 py-2.5" :disabled="!isMyTurn" @click="hint">
+          提示<span v-if="hintOptions.length">（{{ hintIdx + 1 }}/{{ hintOptions.length }}）</span>
+        </button>
       </div>
       <div v-else class="mt-2 h-[52px]"></div>
     </footer>

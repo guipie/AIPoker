@@ -4,6 +4,7 @@
 
 import {
   Card,
+  ddzValue,
   makeDdzDeck,
   shuffle,
   sortDdzCards,
@@ -81,9 +82,16 @@ export interface CardPattern {
 
 // ===================== 牌型识别 =====================
 
+/**
+ * 按「斗地主牌力值」统计各点数张数。
+ * 必须用 ddzValue（2→15），否则 2 会被当成最小的牌，导致「出 2 压不过 3」。
+ */
 function rankCounts(cards: Card[]): Map<number, number> {
   const m = new Map<number, number>();
-  for (const c of cards) m.set(c.rank, (m.get(c.rank) ?? 0) + 1);
+  for (const c of cards) {
+    const v = ddzValue(c);
+    m.set(v, (m.get(v) ?? 0) + 1);
+  }
   return m;
 }
 
@@ -183,7 +191,7 @@ export function detectPattern(cards: Card[]): CardPattern | null {
     const planeRanks = Array.from({ length: bestLen }, (_, i) => bestStart + i);
     const planeSet = new Set(planeRanks);
     if (planeRanks[planeRanks.length - 1] <= 14 && planeRanks[0] >= 3) {
-      const leftover = cards.filter((c) => !planeSet.has(c.rank));
+      const leftover = cards.filter((c) => !planeSet.has(ddzValue(c)));
       const leftCounts = rankCounts(leftover);
       const leftRanks = [...leftCounts.keys()];
       // 纯飞机（不带）
@@ -249,7 +257,7 @@ export function suggestBid(hand: Card[]): number {
 /** 从手牌中找出能压过 lastPlay 的最小合法组合；返回牌数组，null 表示建议不出 */
 export function findBeats(hand: Card[], last: CardPattern): Card[] | null {
   const counts = rankCounts(hand);
-  const byRank = (r: number) => hand.filter((c) => c.rank === r);
+  const byRank = (v: number) => hand.filter((c) => ddzValue(c) === v);
   let candidate: Card[] | null = null;
 
   const pickLowestOver = (pred: (r: number) => boolean): Card[] | null => {
@@ -275,8 +283,8 @@ export function findBeats(hand: Card[], last: CardPattern): Card[] | null {
     case "triple_single": {
       const t = pickLowestOver((r) => counts.get(r)! >= 3);
       if (t) {
-        const tr = Number(t[0].id.split("-")[1]);
-        const kicker = hand.find((c) => c.rank !== tr && c.suit !== "joker");
+        const tv = ddzValue(t[0]);
+        const kicker = hand.find((c) => ddzValue(c) !== tv && c.suit !== "joker");
         if (kicker) candidate = [...t, kicker];
       }
       break;
@@ -284,8 +292,8 @@ export function findBeats(hand: Card[], last: CardPattern): Card[] | null {
     case "triple_pair": {
       const t = pickLowestOver((r) => counts.get(r)! >= 3);
       if (t) {
-        const tr = Number(t[0].id.split("-")[1]);
-        const pr = [...counts.keys()].find((r) => counts.get(r)! >= 2 && r !== tr);
+        const tv = ddzValue(t[0]);
+        const pr = [...counts.keys()].find((r) => counts.get(r)! >= 2 && r !== tv);
         if (pr !== undefined) candidate = [...t, ...byRank(pr).slice(0, 2)];
       }
       break;
@@ -321,30 +329,32 @@ export function findBeats(hand: Card[], last: CardPattern): Card[] | null {
         for (let i = 0; i < need; i++) combo.push(...byRank(start + i).slice(0, perLen));
         if (last.type === "airplane_single" || last.type === "airplane_pair") {
           const used = new Set(combo.map((c) => c.id));
-          const rest = hand.filter((c) => !used.has(c.id) && c.suit !== "joker").sort((a, b) => a.rank - b.rank);
+          const rest = hand
+            .filter((c) => !used.has(c.id) && c.suit !== "joker")
+            .sort((a, b) => ddzValue(a) - ddzValue(b));
           if (last.type === "airplane_pair") {
             // 需要 need 个对子作为带牌
-            const pairRanks: number[] = [];
+            const pairVals: number[] = [];
             for (const c of rest) {
-              const r = c.rank;
-              if (pairRanks.includes(r)) continue;
-              if ((hand.filter((x) => x.rank === r && x.suit !== "joker").length) >= 2) pairRanks.push(r);
-              if (pairRanks.length === need) break;
+              const v = ddzValue(c);
+              if (pairVals.includes(v)) continue;
+              if (hand.filter((x) => ddzValue(x) === v && x.suit !== "joker").length >= 2) pairVals.push(v);
+              if (pairVals.length === need) break;
             }
-            if (pairRanks.length === need) {
+            if (pairVals.length === need) {
               const kickers: Card[] = [];
-              for (const r of pairRanks) kickers.push(...hand.filter((x) => x.rank === r && x.suit !== "joker").slice(0, 2));
+              for (const v of pairVals)
+                kickers.push(...hand.filter((x) => ddzValue(x) === v && x.suit !== "joker").slice(0, 2));
               candidate = [...combo, ...kickers];
             }
           } else {
             // 飞机带单：need 张单牌（取自不同点数，避开三张点数）
-            const usedRanks = new Set(combo.map((c) => c.rank));
+            const usedVals = new Set(combo.map((c) => ddzValue(c)));
             const singles: Card[] = [];
             for (const c of rest) {
               if (singles.length >= need) break;
-              if (usedRanks.has(c.rank)) continue;
-              const already = singles.filter((s) => s.rank === c.rank).length;
-              if (already >= 1) continue; // 单牌不重复点数
+              if (usedVals.has(ddzValue(c))) continue;
+              if (singles.some((s) => ddzValue(s) === ddzValue(c))) continue; // 单牌不重复点数
               singles.push(c);
             }
             if (singles.length === need) candidate = [...combo, ...singles];
@@ -383,20 +393,206 @@ export function findBeats(hand: Card[], last: CardPattern): Card[] | null {
 export function suggestLead(hand: Card[]): Card[] {
   const counts = rankCounts(hand);
   const ranks = [...counts.keys()].sort((a, b) => a - b);
-  // 先尝试拆出顺子（长度>=5）清理连牌
-  // 简单策略：优先出最小的单/对/三
+  // counts 的 key 是牌力值，取牌必须按牌力值匹配（否则 2 会取不到牌 → 空出牌 → 卡死）
+  const byV = (v: number) => hand.filter((c) => ddzValue(c) === v);
+  // 简单策略：优先出最小的单/对/三，保留 2（牌力 15）当大牌
   for (const r of ranks) {
-    if (counts.get(r)! >= 3 && r !== 15) return hand.filter((c) => c.rank === r).slice(0, 3);
+    if (counts.get(r)! >= 3 && r !== 15) return byV(r).slice(0, 3);
   }
   for (const r of ranks) {
-    if (counts.get(r)! >= 2 && r !== 15) return hand.filter((c) => c.rank === r).slice(0, 2);
+    if (counts.get(r)! >= 2 && r !== 15) return byV(r).slice(0, 2);
   }
   for (const r of ranks) {
-    if (counts.get(r)! >= 1 && r !== 15) return hand.filter((c) => c.rank === r).slice(0, 1);
+    if (counts.get(r)! >= 1 && r !== 15) return byV(r).slice(0, 1);
   }
-  // 只剩 2 或大小时
+  // 只剩 2 或大小王时，出牌力最小的那一张
   const lowest = ranks[0];
-  return hand.filter((c) => c.rank === lowest).slice(0, 1);
+  const out = byV(lowest).slice(0, 1);
+  // 防呆：绝不能返回空数组，否则自由领出会被引擎判为非法 → 回合卡死
+  return out.length ? out : hand.slice(0, 1);
+}
+
+// ===================== 提示（人类玩家） =====================
+
+/** 牌型在提示列表里的排序权重：普通牌型 → 炸弹 → 王炸 */
+function hintWeight(p: CardPattern): number {
+  if (p.type === "rocket") return 3;
+  if (p.type === "bomb") return 2;
+  return 1;
+}
+
+/**
+ * 枚举所有「能压过 last」的出牌组合（last 为 null 表示自由领出，枚举所有可出的牌型）。
+ * 返回顺序：普通牌型（按牌力从小到大）→ 炸弹 → 王炸，供「提示」按钮循环切换。
+ * 每个点数/起点的带牌只取最小的一种，避免组合爆炸。
+ */
+export function findAllBeats(hand: Card[], last: CardPattern | null): Card[][] {
+  const counts = rankCounts(hand);
+  const byV = (v: number) => hand.filter((c) => ddzValue(c) === v);
+  const values = [...counts.keys()].sort((a, b) => a - b);
+  const nonJoker = hand.filter((c) => c.suit !== "joker");
+  const res: Card[][] = [];
+  const seen = new Set<string>();
+
+  const push = (cards: Card[]) => {
+    if (cards.length === 0) return;
+    if (cards.some((c) => !c)) return;
+    const p = detectPattern(cards);
+    if (!p || !canBeat(p, last)) return;
+    const key = cards
+      .map((c) => c.id)
+      .sort()
+      .join("|");
+    if (seen.has(key)) return;
+    seen.add(key);
+    res.push(cards);
+  };
+
+  const isType = (...ts: PatternType[]) => !last || ts.includes(last.type);
+  const over = (v: number) => !last || v > last.mainRank;
+  /** 取 n 张点数互不相同的最小带牌（排除 exclude 中的点数，不带王） */
+  const minSingles = (n: number, exclude: number[]) => {
+    const picks: Card[] = [];
+    const used = new Set<number>();
+    for (const c of nonJoker.filter((x) => !exclude.includes(ddzValue(x))).sort((a, b) => ddzValue(a) - ddzValue(b))) {
+      if (picks.length >= n) break;
+      const v = ddzValue(c);
+      if (used.has(v)) continue;
+      used.add(v);
+      picks.push(c);
+    }
+    return picks.length === n ? picks : null;
+  };
+  const minPairs = (n: number, exclude: number[]) => {
+    const vs: number[] = [];
+    for (const v of values) {
+      if (exclude.includes(v)) continue;
+      if ((counts.get(v) ?? 0) >= 2 && v !== 16 && v !== 17) vs.push(v);
+      if (vs.length === n) break;
+    }
+    return vs.length === n ? vs.flatMap((v) => byV(v).slice(0, 2)) : null;
+  };
+
+  // 1) 单张 / 对子 / 三张
+  for (const v of values) {
+    if (isType("single") && over(v)) push(byV(v).slice(0, 1));
+    if (isType("pair") && (counts.get(v) ?? 0) >= 2 && over(v)) push(byV(v).slice(0, 2));
+    if (isType("triple") && (counts.get(v) ?? 0) >= 3 && over(v)) push(byV(v).slice(0, 3));
+  }
+
+  // 2) 三带一 / 三带二
+  if (isType("triple_single", "triple_pair")) {
+    for (const v of values) {
+      if ((counts.get(v) ?? 0) < 3) continue;
+      if (last && (last.type === "triple_single" || last.type === "triple_pair") && v <= last.mainRank) continue;
+      const t = byV(v).slice(0, 3);
+      if (isType("triple_single")) {
+        const k = minSingles(1, [v]);
+        if (k) push([...t, ...k]);
+      }
+      if (isType("triple_pair")) {
+        const k = minPairs(1, [v]);
+        if (k) push([...t, ...k]);
+      }
+    }
+  }
+
+  // 3) 顺子
+  if (isType("straight")) {
+    const lens = last?.type === "straight" ? [last.length] : [5, 6, 7, 8, 9, 10, 11, 12];
+    for (const len of lens) {
+      for (let start = 3; start + len - 1 <= 14; start++) {
+        let ok = true;
+        for (let i = 0; i < len; i++) if ((counts.get(start + i) ?? 0) < 1) { ok = false; break; }
+        if (!ok) continue;
+        if (last?.type === "straight" && start + len - 1 <= last.mainRank) continue;
+        const cards: Card[] = [];
+        for (let i = 0; i < len; i++) cards.push(byV(start + i)[0]);
+        push(cards);
+      }
+    }
+  }
+
+  // 4) 连对
+  if (isType("pair_straight")) {
+    const lens = last?.type === "pair_straight" ? [last.length] : [3, 4, 5, 6, 7, 8, 9, 10];
+    for (const len of lens) {
+      for (let start = 3; start + len - 1 <= 14; start++) {
+        let ok = true;
+        for (let i = 0; i < len; i++) if ((counts.get(start + i) ?? 0) < 2) { ok = false; break; }
+        if (!ok) continue;
+        if (last?.type === "pair_straight" && start + len - 1 <= last.mainRank) continue;
+        const cards: Card[] = [];
+        for (let i = 0; i < len; i++) cards.push(...byV(start + i).slice(0, 2));
+        push(cards);
+      }
+    }
+  }
+
+  // 5) 飞机（不带 / 带单 / 带对）
+  const PLANE: PatternType[] = ["airplane", "airplane_single", "airplane_pair"];
+  if (isType(...PLANE)) {
+    const lens = last && PLANE.includes(last.type) ? [last.length] : [2, 3, 4, 5, 6];
+    for (const len of lens) {
+      for (let start = 3; start + len - 1 <= 14; start++) {
+        let ok = true;
+        for (let i = 0; i < len; i++) if ((counts.get(start + i) ?? 0) < 3) { ok = false; break; }
+        if (!ok) continue;
+        if (last && PLANE.includes(last.type) && start + len - 1 <= last.mainRank) continue;
+        const combo: Card[] = [];
+        for (let i = 0; i < len; i++) combo.push(...byV(start + i).slice(0, 3));
+        const body = Array.from({ length: len }, (_, i) => start + i);
+        if (isType("airplane")) push(combo);
+        if (isType("airplane_single")) {
+          const k = minSingles(len, body);
+          if (k) push([...combo, ...k]);
+        }
+        if (isType("airplane_pair")) {
+          const k = minPairs(len, body);
+          if (k) push([...combo, ...k]);
+        }
+      }
+    }
+  }
+
+  // 6) 四带二
+  if (isType("four_two_single", "four_two_pair")) {
+    for (const v of values) {
+      if ((counts.get(v) ?? 0) < 4) continue;
+      if (last && (last.type === "four_two_single" || last.type === "four_two_pair") && v <= last.mainRank) continue;
+      const quad = byV(v).slice(0, 4);
+      if (isType("four_two_single")) {
+        const k = minSingles(2, [v]);
+        if (k) push([...quad, ...k]);
+      }
+      if (isType("four_two_pair")) {
+        const k = minPairs(2, [v]);
+        if (k) push([...quad, ...k]);
+      }
+    }
+  }
+
+  // 7) 炸弹 / 王炸（任何牌型都能用它们压）
+  for (const v of values) {
+    if ((counts.get(v) ?? 0) !== 4) continue;
+    if (last?.type === "bomb" && v <= last.mainRank) continue;
+    push(byV(v).slice(0, 4));
+  }
+  const small = hand.find((c) => c.suit === "joker" && c.rank === 16);
+  const big = hand.find((c) => c.suit === "joker" && c.rank === 17);
+  if (small && big && last?.type !== "rocket") push([small, big]);
+
+  res.sort((a, b) => {
+    const pa = detectPattern(a)!;
+    const pb = detectPattern(b)!;
+    const wa = hintWeight(pa);
+    const wb = hintWeight(pb);
+    if (wa !== wb) return wa - wb;
+    if (pa.mainRank !== pb.mainRank) return pa.mainRank - pb.mainRank;
+    if (pa.length !== pb.length) return pa.length - pb.length;
+    return a.length - b.length;
+  });
+  return res;
 }
 
 // ===================== 游戏主体 =====================
