@@ -613,7 +613,8 @@ onDeactivated(() => {
           </div>
         </div>
         <div class="mb-4 text-xs text-white/45">
-          提示：到「设置」修正 API Key，或关闭大模型改用内置规则引擎。
+          提示：可到「Agent 广场」点卡片上的「✏️ 模型」修改该 agent 的接口 / Key / 模型名；
+          或到「设置」修正全局 Key，或关闭大模型改用内置规则引擎。
         </div>
         <div class="flex flex-wrap justify-center gap-3">
           <button class="btn btn-slate px-5 py-2 text-sm" @click="requestNewGame(lastList)">重试</button>

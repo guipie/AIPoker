@@ -143,6 +143,7 @@ const SETTINGS_KEY = "puke.settings.v2";
 const STATS_KEY = "puke.stats.v2";
 const CUSTOM_KEY = "puke.customAgents.v1";
 const DEFAULTS_KEY = "puke.defaultAgentIds.v1";
+const OVERRIDES_KEY = "puke.agentOverrides.v1";
 
 const defaultSettings: LlmSettings = {
   enabled: false,
@@ -184,6 +185,23 @@ function loadDefaultIds(): string[] {
   return [];
 }
 
+/** agent 的模型配置覆盖（内置 agent 也可改用别的大模型） */
+export interface AgentModelOverride {
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+}
+
+function loadOverrides(): Record<string, AgentModelOverride> {
+  try {
+    const raw = localStorage.getItem(OVERRIDES_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {
+    /* ignore */
+  }
+  return {};
+}
+
 export interface Stats {
   ddz: { win: number; lose: number };
   holdem: { win: number; lose: number };
@@ -206,6 +224,7 @@ export const store = reactive({
   selectedAgentIds: [] as string[], // Agent 广场多选（用于开始按钮）
   defaultAgentIds: loadDefaultIds(), // 设为「默认」的 agent（开局优先）
   customAgents: loadCustom(), // 用户自定义大模型 agent
+  agentOverrides: loadOverrides(), // 内置/自定义 agent 的模型配置覆盖（model/baseUrl/apiKey）
   startAgents: null as string[] | null, // 从广场开局时指定的对手列表
   pendingNewGame: null as GameMode | null, // 标记进入视图后需开新局
   activeGame: null as GameMode | null, // 当前进行中的牌局（用于悬浮圆球）
@@ -242,10 +261,52 @@ function saveDefaultIds() {
     /* ignore */
   }
 }
+function saveOverrides() {
+  try {
+    localStorage.setItem(OVERRIDES_KEY, JSON.stringify(store.agentOverrides));
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 保存某个 agent 的模型配置覆盖（baseUrl/model/apiKey；字段未提供=保持不变，空串=清除该项回落默认） */
+export function saveAgentOverride(id: string, patch: AgentModelOverride) {
+  const cur: AgentModelOverride = { ...(store.agentOverrides[id] ?? {}) };
+  for (const k of ["baseUrl", "apiKey", "model"] as const) {
+    if (patch[k] === undefined) continue; // 未提供该字段 → 不动
+    const v = patch[k].trim();
+    if (v) cur[k] = v;
+    else delete cur[k]; // 显式传空串 = 清除覆盖
+  }
+  if (Object.keys(cur).length === 0) delete store.agentOverrides[id];
+  else store.agentOverrides[id] = cur;
+  saveOverrides();
+}
+
+/** 清除某个 agent 的全部模型配置覆盖（恢复默认） */
+export function clearAgentOverride(id: string) {
+  delete store.agentOverrides[id];
+  saveOverrides();
+}
+
+/** 直接修改自定义 agent 的模型配置（写回 customAgents 并持久化） */
+export function updateCustomAgent(id: string, patch: AgentModelOverride) {
+  const a = store.customAgents.find((c) => c.id === id);
+  if (!a) return;
+  if (patch.baseUrl !== undefined) a.baseUrl = patch.baseUrl.trim() || undefined;
+  if (patch.apiKey !== undefined) a.apiKey = patch.apiKey.trim() || undefined;
+  if (patch.model !== undefined) a.model = patch.model.trim() || store.settings.model;
+  saveCustom();
+}
 
 // ===================== Agent 查询 =====================
 export function allAgents(): AgentDef[] {
-  return [...AGENTS, ...store.customAgents];
+  // 合并模型配置覆盖，使内置 agent 也能用用户指定的 baseUrl/apiKey/model
+  const merged = [...AGENTS, ...store.customAgents].map((a) => {
+    const o = store.agentOverrides[a.id];
+    return o ? { ...a, ...o } : a;
+  });
+  return merged;
 }
 
 export function agentById(id: string): AgentDef | undefined {

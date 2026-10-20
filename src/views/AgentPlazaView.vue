@@ -1,6 +1,17 @@
 <script setup lang="ts">
 import { ref, reactive, computed } from "vue";
-import { store, allAgents, agentById, toggleDefault, addCustomAgent, beginGame, type AgentDef } from "../store";
+import {
+  store,
+  allAgents,
+  agentById,
+  toggleDefault,
+  addCustomAgent,
+  saveAgentOverride,
+  clearAgentOverride,
+  updateCustomAgent,
+  beginGame,
+  type AgentDef,
+} from "../store";
 import { sfx } from "../audio/sfx";
 import { testLlmConnection, type LlmConfig } from "../engine/llm";
 
@@ -92,6 +103,62 @@ function openModal() {
 
 const saving = ref(false);
 
+// ===== 修改某个 agent 的模型配置（内置 agent 也支持，持久化覆盖） =====
+const showEdit = ref(false);
+const editTarget = ref<AgentDef | null>(null);
+const editForm = reactive({ baseUrl: "", apiKey: "", model: "" });
+const editError = ref("");
+const editTesting = ref(false);
+const editIsCustom = computed(() => !!editTarget.value?.isCustom);
+const editHasOverride = computed(
+  () => !!editTarget.value && !!store.agentOverrides[editTarget.value.id],
+);
+
+function openEdit(a: AgentDef) {
+  sfx.click();
+  editTarget.value = a;
+  // 预填当前生效配置：覆盖值 / 自定义值；都没有则留空（回落全局）
+  editForm.baseUrl = a.baseUrl ?? "";
+  editForm.apiKey = a.apiKey ?? "";
+  editForm.model = a.model ?? store.settings.model;
+  editError.value = "";
+  showEdit.value = true;
+}
+
+async function saveEdit() {
+  const t = editTarget.value;
+  if (!t) return;
+  editTesting.value = true;
+  editError.value = "正在检测大模型连接…";
+  const cfg: LlmConfig = {
+    enabled: store.settings.enabled,
+    baseUrl: editForm.baseUrl.trim() || store.settings.baseUrl,
+    model: editForm.model.trim() || store.settings.model,
+    apiKey: editForm.apiKey.trim() || store.settings.apiKey,
+    persona: t.persona ?? "",
+    temperature: store.settings.temperature,
+  };
+  const r = await testLlmConnection(cfg);
+  editTesting.value = false;
+  if (!r.ok) {
+    editError.value = "大模型连接失败：" + r.error;
+    return;
+  }
+  editError.value = "";
+  if (t.isCustom) updateCustomAgent(t.id, { ...editForm });
+  else saveAgentOverride(t.id, { ...editForm });
+  sfx.click();
+  showEdit.value = false;
+}
+
+function resetOverride() {
+  const t = editTarget.value;
+  if (!t || t.isCustom) return;
+  sfx.click();
+  clearAgentOverride(t.id);
+  showEdit.value = false;
+}
+
 async function saveCustom() {
   if (!form.name.trim()) {
     formError.value = "请填写名称";
@@ -153,6 +220,7 @@ async function saveCustom() {
       </div>
       <p class="mb-4 text-sm text-amber-100/60">
         点选卡片多选对手；点 ★ 设为「默认」（开局优先显示，没有默认则随机）。选好后右上角直接开局。
+        点卡片上的「✏️ 模型」可修改该 agent 使用的接口 / Key / 模型名（开局前会逐一检测连通性）。
         <span class="text-amber-300">已选 {{ store.selectedAgentIds.length }}/{{ MAX }}</span>
       </p>
 
@@ -227,12 +295,21 @@ async function saveCustom() {
             </div>
           </div>
 
-          <div class="mt-3 flex items-center justify-between">
-            <span class="rounded-full bg-black/40 px-2 py-0.5 text-[10px] text-emerald-200/80">
-              模型：{{ a.model ?? "全局设置" }}
-              <span v-if="a.baseUrl" class="text-amber-200/70">· 自定义</span>
-            </span>
-            <span class="text-xs" :class="selected.has(a.id) ? 'text-amber-300' : 'text-white/40'">
+          <div class="mt-3 flex items-center justify-between gap-2">
+            <button
+              class="min-w-0 truncate rounded-full bg-black/40 px-2 py-1 text-[10px] text-emerald-200/80 transition-colors hover:bg-black/60 hover:text-amber-200"
+              :title="a.isCustom ? '修改该模型的接口/Key/模型名' : '修改该 agent 使用的大模型（接口/Key/模型名）'"
+              @click.stop="openEdit(a)"
+            >
+              ✏️ 模型：{{ a.model ?? "全局设置" }}
+              <span v-if="a.baseUrl" class="text-amber-200/70">· 自定义接口</span>
+              <span
+                v-if="store.agentOverrides[a.id]"
+                class="ml-1 rounded bg-sky-600/80 px-1 text-[9px] text-white"
+                >已改</span
+              >
+            </button>
+            <span class="shrink-0 text-xs" :class="selected.has(a.id) ? 'text-amber-300' : 'text-white/40'">
               {{ selected.has(a.id) ? "已选 ✓" : (store.defaultAgentIds.includes(a.id) ? "默认 ★" : "点击选择") }}
             </span>
           </div>
@@ -297,6 +374,77 @@ async function saveCustom() {
             <button class="btn btn-primary px-6 py-2 text-sm" :disabled="saving" @click="saveCustom">
               {{ saving ? "检测中…" : "保存并添加" }}
             </button>
+          </div>
+        </div>
+      </div>
+    </transition>
+
+    <!-- 修改模型配置弹窗 -->
+    <transition name="ball">
+      <div
+        v-if="showEdit && editTarget"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+        @click.self="showEdit = false"
+      >
+        <div class="w-[460px] max-w-full rounded-3xl border border-white/15 bg-gradient-to-b from-slate-800 to-slate-900 p-6 shadow-2xl">
+          <div class="mb-1 text-xl font-black text-amber-100">⚙️ 修改模型配置</div>
+          <div class="mb-4 text-xs text-white/55">
+            {{ editTarget.name }}（{{ editIsCustom ? "自定义模型" : "内置 agent" }}）· 留空的项将回落到「设置」里的全局配置
+          </div>
+
+          <div class="space-y-3">
+            <div>
+              <label class="mb-1 block text-xs font-semibold text-white/70">接口地址 Base URL</label>
+              <input
+                v-model="editForm.baseUrl"
+                class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
+                :placeholder="'留空使用全局地址（' + store.settings.baseUrl + '）'"
+              />
+            </div>
+            <div class="grid grid-cols-2 gap-3">
+              <div>
+                <label class="mb-1 block text-xs font-semibold text-white/70">模型名称</label>
+                <input
+                  v-model="editForm.model"
+                  class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
+                  placeholder="如 deepseek-chat"
+                />
+              </div>
+              <div>
+                <label class="mb-1 block text-xs font-semibold text-white/70">API Key</label>
+                <input
+                  v-model="editForm.apiKey"
+                  type="password"
+                  class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
+                  placeholder="留空使用全局 Key"
+                />
+              </div>
+            </div>
+
+            <div
+              v-if="editError"
+              class="rounded-lg px-3 py-2 text-xs"
+              :class="editTesting ? 'bg-sky-500/20 text-sky-200' : 'bg-rose-500/20 text-rose-200'"
+            >
+              {{ editError }}
+            </div>
+          </div>
+
+          <div class="mt-5 flex items-center justify-between gap-3">
+            <button
+              v-if="!editIsCustom && editHasOverride"
+              class="btn-ghost rounded-xl px-4 py-2 text-xs"
+              @click="resetOverride"
+            >
+              ↺ 恢复默认配置
+            </button>
+            <span v-else></span>
+            <div class="flex gap-3">
+              <button class="btn-ghost rounded-xl px-5 py-2 text-sm" :disabled="editTesting" @click="showEdit = false">取消</button>
+              <button class="btn btn-primary px-6 py-2 text-sm" :disabled="editTesting" @click="saveEdit">
+                {{ editTesting ? "检测中…" : "检测并保存" }}
+              </button>
+            </div>
           </div>
         </div>
       </div>
