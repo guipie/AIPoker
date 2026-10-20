@@ -1,6 +1,7 @@
-// 自测：斗地主出牌记录（recentActions） + 大模型连通性检测的基础校验
+// 自测：斗地主出牌记录（recentActions） + 大模型连通性检测（含模型名校验）
+import { createServer } from "node:http";
 import { DoudizhuGame } from "../src/engine/doudizhu";
-import { testLlmConnection } from "../src/engine/llm";
+import { modelNotInList, testLlmConnection } from "../src/engine/llm";
 
 let failed = 0;
 function assert(cond: any, msg: string) {
@@ -33,40 +34,71 @@ assert(
   "不出动作已写入 recentActions",
 );
 
-console.log(
-  "  最近动作：",
-  s.recentActions
-    .map((a: any) => {
-      const who = s.players[a.playerId].name;
-      if (a.type === "pass") return `${who}:不出`;
-      return `${who}:出 ${a.cards.map((c: any) => c.rank).join("/")}`;
-    })
-    .join(" | "),
+// 2) 模型名列表校验（纯函数）
+assert(
+  modelNotInList(["deepseek-flash", "deepseek-v4-pro"], "qwen2.5:7b") !== null,
+  "不支持的模型名会被识别出来",
 );
+assert(
+  modelNotInList(["deepseek-flash", "deepseek-v4-pro"], "deepseek-flash") === null,
+  "受支持的模型名通过",
+);
+assert(modelNotInList([], "anything") === null, "空列表不做判断");
+assert(modelNotInList(["DeepSeek-Chat"], "deepseek-chat") === null, "模型名大小写不敏感");
 
-// 2) 空 BaseURL 明确报错（不触网）
-const r1 = await testLlmConnection({
+// 3) 本地假服务：/models 返回 200 但只支持 deepseek-*，复现“假在线”bug
+const srv = createServer((req, res) => {
+  if (req.url?.endsWith("/models")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ data: [{ id: "deepseek-flash" }, { id: "deepseek-v4-pro" }] }));
+    return;
+  }
+  if (req.url?.endsWith("/chat/completions")) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: {
+          code: "invalid_request_error",
+          message: "The supported API model names are deepseek-flash, deepseek-v4-pro",
+        },
+      }),
+    );
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+const port = (srv.address() as any).port;
+const base = `http://127.0.0.1:${port}/v1`;
+const mk = (model: string) => ({
   enabled: true,
-  baseUrl: "",
-  model: "x",
-  apiKey: "k",
+  baseUrl: base,
+  model,
+  apiKey: "sk-test",
   persona: "",
   temperature: 0.5,
 });
+
+const bad = await testLlmConnection(mk("qwen2.5:7b"));
+assert(
+  !bad.ok && bad.error.includes("不在该接口支持的模型列表中"),
+  "回归：模型名不支持时不再误判为“在线”",
+);
+console.log("  报错信息：", bad.error);
+
+const good = await testLlmConnection(mk("deepseek-flash"));
+assert(good.ok, "受支持的模型名 → 判为在线");
+
+// 4) 基础校验
+const r1 = await testLlmConnection({ ...mk("x"), baseUrl: "" });
 assert(!r1.ok && r1.error.includes("接口地址"), "空 BaseURL 返回明确错误");
 
-// 3) 缺 Key 不再被提前拦截（兼容本地 Ollama 等无 Key 场景）
-const r2 = await testLlmConnection({
-  enabled: true,
-  baseUrl: "http://127.0.0.1:9/v1",
-  model: "x",
-  apiKey: "",
-  persona: "",
-  temperature: 0.5,
-});
+const r2 = await testLlmConnection({ ...mk("x"), baseUrl: "http://127.0.0.1:9/v1", apiKey: "" });
 assert(!r2.ok, "不可达地址返回失败");
 assert(!r2.error.includes("未填写 API Key"), "缺 Key 不提前拦截（兼容本地模型）");
-console.log("  不可达检测返回：", r2.error);
+
+srv.close();
 
 console.log(failed === 0 ? "\n全部通过 🎉" : `\n${failed} 项失败`);
 if (failed) process.exitCode = 1;

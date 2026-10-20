@@ -214,30 +214,42 @@ async function driveBots() {
       let raiseTo: number | undefined;
 
       if (store.settings.enabled && (store.settings.apiKey || agentFor(id)?.apiKey)) {
+        const aid = agentMap.value[id];
+        let llmErr: string | null = null;
         try {
-          const out = await llmHoldemDecision(llmConfigFor(id), {
-            hole: player.hole.map(holdemLabel),
-            community: s.community.map(holdemLabel),
-            pot: s.pot,
-            toCall: s.toCall,
-            minRaise: s.minRaise,
-            stack: player.stack,
-            currentBet: s.currentBet,
-            players: s.players.map(p => ({
-              name: p.name,
-              stack: p.stack,
-              folded: p.hasFolded,
-              committed: p.committed,
-            })),
-            position: player.isDealer ? "庄家" : "玩家",
-            persona: agentFor(id)?.persona,
-          });
+          const out = await llmHoldemDecision(
+            llmConfigFor(id),
+            {
+              hole: player.hole.map(holdemLabel),
+              community: s.community.map(holdemLabel),
+              pot: s.pot,
+              toCall: s.toCall,
+              minRaise: s.minRaise,
+              stack: player.stack,
+              currentBet: s.currentBet,
+              players: s.players.map((p) => ({
+                name: p.name,
+                stack: p.stack,
+                folded: p.hasFolded,
+                committed: p.committed,
+              })),
+              position: player.isDealer ? "庄家" : "玩家",
+              persona: agentFor(id)?.persona,
+            },
+            (msg) => {
+              llmErr = msg;
+              if (aid) markOffline(aid, msg);
+            },
+          );
           if (out) {
             action = out.action;
             raiseTo = out.raiseTo;
           }
-        } catch {
-          /* 回退规则 */
+          if (aid && !llmErr) markOnline(aid);
+        } catch (e: any) {
+          const emsg = e?.message ?? String(e);
+          llmErr = emsg;
+          if (aid) markOffline(aid, emsg);
         }
       }
       if (action === "check" && s.toCall > 0) action = "call";
@@ -396,6 +408,24 @@ async function recheckOne(id: string) {
       [id]: { ok: r.ok, model: agentById(id)?.model ?? store.settings.model, error: r.error },
     };
   }
+}
+
+/** 运行时调用大模型失败 → 把该 agent 标记为不在线，并显示服务端原因 */
+function markOffline(id: string, msg: string) {
+  agentOnline.value = {
+    ...agentOnline.value,
+    [id]: { ok: false, model: agentById(id)?.model ?? store.settings.model, error: msg },
+  };
+}
+
+/** 调用成功 → 若之前被标记为不在线，恢复为在线 */
+function markOnline(id: string) {
+  const prev = agentOnline.value[id];
+  if (!prev || prev.ok) return;
+  agentOnline.value = {
+    ...agentOnline.value,
+    [id]: { ok: true, model: agentById(id)?.model ?? store.settings.model },
+  };
 }
 
 function openModelEditor(id: number) {

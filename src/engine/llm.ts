@@ -35,7 +35,17 @@ export async function callChat(config: LlmConfig, messages: ChatMessage[]): Prom
       }),
       signal: ctrl.signal,
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    if (!resp.ok) {
+      // 带上服务端返回的 message（如“模型名不支持”），方便定位
+      let detail = "";
+      try {
+        const d = await resp.json();
+        detail = d?.error?.message ?? d?.message ?? "";
+      } catch {
+        /* ignore */
+      }
+      throw new Error(`HTTP ${resp.status}${detail ? "：" + detail : ""}`);
+    }
     const data = await resp.json();
     return data?.choices?.[0]?.message?.content ?? "";
   } finally {
@@ -118,6 +128,34 @@ async function probeByChat(
  * 测试大模型接口连通性 / API Key 是否正确。
  * 优先探测 /models（开销小），不支持时回退到一次极短对话。
  */
+/**
+ * 校验配置的模型名是否在接口返回的模型列表中。
+ * 返回错误信息（null 表示通过 / 列表为空无法判断）。
+ * 说明：只判断 /models 是否 200 是不够的——那样模型名填错也会被判“在线”，
+ * 真正调用时才报 invalid_request_error。
+ */
+export function modelNotInList(available: string[], model: string): string | null {
+  const ids = available.filter(Boolean);
+  if (!ids.length) return null; // 列表为空 → 不做判断
+  const m = (model ?? "").trim();
+  if (!m) return null;
+  const hit = ids.some((id) => id.toLowerCase() === m.toLowerCase());
+  if (hit) return null;
+  const hint = ids.slice(0, 6).join("、") + (ids.length > 6 ? "…" : "");
+  return `模型「${m}」不在该接口支持的模型列表中（可用：${hint}）`;
+}
+
+/** 解析 /models 的返回，取出模型 id 列表（兼容 {data:[{id}]} 与纯数组两种格式） */
+async function parseModelIds(resp: Response): Promise<string[]> {
+  try {
+    const d = await resp.json();
+    const arr = Array.isArray(d?.data) ? d.data : Array.isArray(d) ? d : [];
+    return arr.map((x: any) => (typeof x === "string" ? x : (x?.id ?? ""))).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 export async function testLlmConnection(config: LlmConfig): Promise<ConnTestResult> {
   const base = config.baseUrl.replace(/\/$/, "");
   if (!base) return { ok: false, error: "未填写接口地址（Base URL）" };
@@ -130,7 +168,15 @@ export async function testLlmConnection(config: LlmConfig): Promise<ConnTestResu
   const timer = setTimeout(() => ctrl.abort(), 10000);
   try {
     const r = await fetch(`${base}/models`, { method: "GET", headers, signal: ctrl.signal });
-    if (r.ok) return { ok: true, error: "" };
+    if (r.ok) {
+      // 关键：不仅看接口通不通，还要校验“这个模型名该服务是否真的支持”
+      const ids = await parseModelIds(r);
+      const bad = modelNotInList(ids, config.model);
+      if (bad) return { ok: false, error: bad };
+      if (ids.length) return { ok: true, error: "" };
+      // 拿不到模型列表 → 用一次极短对话验证模型可用性
+      return await probeByChat(base, headers, config.model, ctrl.signal);
+    }
     let detail = "";
     try {
       const d = await r.json();
@@ -177,7 +223,11 @@ export interface HoldemLlmOutput {
   reason?: string;
 }
 
-export async function llmHoldemDecision(config: LlmConfig, input: HoldemLlmInput): Promise<HoldemLlmOutput | null> {
+export async function llmHoldemDecision(
+  config: LlmConfig,
+  input: HoldemLlmInput,
+  onError?: (msg: string) => void,
+): Promise<HoldemLlmOutput | null> {
   const system = `你是一名德州扑克 AI 玩家${
     input.persona ? "，人设：" + input.persona : ""
   }。请根据牌局给出行动。只输出 JSON，格式：{"action":"fold"|"check"|"call"|"raise","raiseTo":<加注后本轮总投入整数，仅 raise 时>,"reason":"简短中文理由"}。注意底池赔率与手牌强度，避免无谓跟注。`;
@@ -195,7 +245,8 @@ ${input.players.map((p) => `- ${p.name} 筹码${p.stack} 已投入${p.committed}
     const out = parseJsonObject<HoldemLlmOutput>(text);
     if (out && ["fold", "check", "call", "raise"].includes(out.action)) return out;
     return null;
-  } catch {
+  } catch (e: any) {
+    onError?.(e?.message ?? String(e));
     return null;
   }
 }
@@ -221,7 +272,11 @@ export interface DdzLlmOutput {
   reason?: string;
 }
 
-export async function llmDdzDecision(config: LlmConfig, input: DdzLlmInput): Promise<DdzLlmOutput | null> {
+export async function llmDdzDecision(
+  config: LlmConfig,
+  input: DdzLlmInput,
+  onError?: (msg: string) => void,
+): Promise<DdzLlmOutput | null> {
   // 身份策略提示：农民要配合队友，地主是独战
   let roleHint = "";
   if (input.myRole === "农民" && input.teammates.length) {
@@ -277,7 +332,8 @@ ${
     const out = parseJsonObject<DdzLlmOutput>(text);
     if (out && (out.play === null || Array.isArray(out.play))) return out;
     return null;
-  } catch {
+  } catch (e: any) {
+    onError?.(e?.message ?? String(e));
     return null;
   }
 }
