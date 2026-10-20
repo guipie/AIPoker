@@ -60,6 +60,102 @@ export function parseJsonObject<T>(text: string): T | null {
   }
 }
 
+// ===================== 连通性检测（验证 Key / 接口是否可用） =====================
+
+export interface ConnTestResult {
+  ok: boolean;
+  error: string; // 失败原因（中文，可直接展示给用户）
+}
+
+function friendlyNetError(e: any): string {
+  if (e?.name === "AbortError") return "连接超时（10 秒未响应）";
+  const msg = String(e?.message ?? "");
+  if (msg.includes("Failed to fetch") || msg.includes("NetworkError")) {
+    return "无法连接（接口地址错误、网络不通，或浏览器跨域限制）";
+  }
+  return `无法连接：${msg || "网络错误"}`;
+}
+
+/** 用一次极短对话验证（当服务不提供 /models 时回退到此方式） */
+async function probeByChat(
+  base: string,
+  headers: Record<string, string>,
+  model: string,
+  signal: AbortSignal,
+): Promise<ConnTestResult> {
+  try {
+    const r = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "ping" }],
+        max_tokens: 1,
+      }),
+      signal,
+    });
+    if (r.ok) return { ok: true, error: "" };
+    let detail = "";
+    try {
+      const d = await r.json();
+      detail = d?.error?.message ?? d?.message ?? "";
+    } catch {
+      /* ignore */
+    }
+    if (r.status === 401 || r.status === 403) {
+      return { ok: false, error: `API Key 无效或已失效（HTTP ${r.status}）${detail ? "：" + detail : ""}` };
+    }
+    if (r.status === 404) {
+      return { ok: false, error: `模型「${model}」不存在或接口地址不对（HTTP 404）` };
+    }
+    return { ok: false, error: `接口返回 HTTP ${r.status}${detail ? "：" + detail : ""}` };
+  } catch (e: any) {
+    return { ok: false, error: friendlyNetError(e) };
+  }
+}
+
+/**
+ * 测试大模型接口连通性 / API Key 是否正确。
+ * 优先探测 /models（开销小），不支持时回退到一次极短对话。
+ */
+export async function testLlmConnection(config: LlmConfig): Promise<ConnTestResult> {
+  const base = config.baseUrl.replace(/\/$/, "");
+  if (!base) return { ok: false, error: "未填写接口地址（Base URL）" };
+  // 注意：本地 Ollama 等无需 Key，这里不强制要求 apiKey，交给接口返回结果判断。
+
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (config.apiKey) headers.Authorization = `Bearer ${config.apiKey}`;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(`${base}/models`, { method: "GET", headers, signal: ctrl.signal });
+    if (r.ok) return { ok: true, error: "" };
+    let detail = "";
+    try {
+      const d = await r.json();
+      detail = d?.error?.message ?? d?.message ?? "";
+    } catch {
+      /* ignore */
+    }
+    if (r.status === 401 || r.status === 403) {
+      return { ok: false, error: `API Key 无效或无权访问（HTTP ${r.status}）${detail ? "：" + detail : ""}` };
+    }
+    if (r.status === 404) {
+      // 该服务没有 /models 端点，改用极短对话验证
+      return await probeByChat(base, headers, config.model, ctrl.signal);
+    }
+    return { ok: false, error: `接口返回 HTTP ${r.status}${detail ? "：" + detail : ""}` };
+  } catch (e: any) {
+    // /models 请求本身失败（网络/DNS/CORS），再用对话端点确认一次
+    const chat = await probeByChat(base, headers, config.model, ctrl.signal);
+    if (chat.ok) return chat;
+    return { ok: false, error: friendlyNetError(e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ===================== 德州扑克：让 LLM 决策 =====================
 
 export interface HoldemLlmInput {
@@ -108,8 +204,15 @@ ${input.players.map((p) => `- ${p.name} 筹码${p.stack} 已投入${p.committed}
 
 export interface DdzLlmInput {
   hand: string[];
-  lastPlay: string[] | null;
-  myRole: string;
+  lastPlay: string[] | null; // 当前需要压过的牌（自由领出时为 null）
+  lastPlayerName: string | null; // 这手牌是谁打出的
+  freeLead: boolean; // 本轮是否由我领出
+  myRole: string; // "地主" | "农民" | "未定"
+  landlordName: string; // 地主是谁
+  teammates: string[]; // 我的队友（地主时为空）
+  opponents: string[]; // 我的对手
+  seats: { name: string; role: string; handCount: number; relation: string }[]; // 按出牌顺序
+  recentActions: string[]; // 最近各家出牌结果（按时间顺序，含“不出”）
   persona?: string;
 }
 
@@ -119,13 +222,53 @@ export interface DdzLlmOutput {
 }
 
 export async function llmDdzDecision(config: LlmConfig, input: DdzLlmInput): Promise<DdzLlmOutput | null> {
+  // 身份策略提示：农民要配合队友，地主是独战
+  let roleHint = "";
+  if (input.myRole === "农民" && input.teammates.length) {
+    roleHint = `你是农民，队友是：${input.teammates.join("、")}。要和队友配合打地主：地主出的牌尽量压住；队友出的牌一般不要压（除非你能一把走完，或需要给队友让路）。`;
+  } else if (input.myRole === "地主") {
+    roleHint = `你是地主，独战所有农民（${input.opponents.join("、")}），他们会联合针对你。控制节奏，用小牌消耗、留大牌和炸弹控场。`;
+  }
+
   const system = `你是一名斗地主 AI 玩家${
     input.persona ? "，人设：" + input.persona : ""
-  }。只输出 JSON：{"play":[出牌文本数组，如["♠3","♥3"]；或 null 表示不出],"reason":"简短中文理由"}。若上家出了牌，你出的牌必须能压过它（同牌型更大，或炸弹/王炸）；压不过就输出 null。`;
-  const user = `我的手牌（${input.hand.length} 张）：${input.hand.join(" ")}
-我的身份：${input.myRole}
-${input.lastPlay ? "桌面需要压过的牌：" + input.lastPlay.join(" ") : "当前我可以自由出牌（领出）"}
-请决策出哪几张牌，或不出。`;
+  }。请只输出 JSON：{"play":[出牌文本数组，如["♠3","♥3"]；或 null 表示不出],"reason":"简短中文理由"}。
+规则要点：
+- 必须出合法牌型：单张/对子/三张/三带一/三带二/顺子(5张起)/连对/飞机/四带二/炸弹/王炸。
+- 只能出自己手牌里有的牌，不要凭空捏造。
+- 若不是自由领出，出的牌必须能压过桌面上那手牌（同牌型更大，或用炸弹/王炸）；压不过就输出 null（不出）。
+- 结合各家剩余牌数判断：有人只剩 1-2 张时要优先封堵。
+${roleHint}`;
+
+  const user = `【牌桌信息】
+- 地主：${input.landlordName}
+- 我的身份：${input.myRole}
+${input.teammates.length ? `- 我的队友：${input.teammates.join("、")}` : ""}
+${input.opponents.length ? `- 我的对手：${input.opponents.join("、")}` : ""}
+
+【各家情况】（按出牌顺序）
+${input.seats
+  .map(
+    (p) =>
+      `- ${p.name}（${p.role}${p.relation ? "，" + p.relation : ""}）剩 ${p.handCount} 张${
+        p.handCount <= 2 ? " ⚠️快走完了" : ""
+      }`,
+  )
+  .join("\n")}
+
+【最近出牌结果】（按时间顺序，最新在最后）
+${input.recentActions.length ? input.recentActions.map((a) => `- ${a}`).join("\n") : "- 本局还没有人出牌"}
+
+【当前需要你处理的一手】
+${
+  input.freeLead
+    ? "你是本轮首家，可以自由出任意合法牌型（不能不出）。"
+    : `需要压过的牌：${(input.lastPlay ?? []).join(" ")}（由 ${input.lastPlayerName ?? "上家"} 打出）\n压不过就输出 null（不出）。`
+}
+
+【我的手牌】（${input.hand.length} 张）：${input.hand.join(" ")}
+请决策。`;
+
   try {
     const text = await callChat(config, [
       { role: "system", content: system },

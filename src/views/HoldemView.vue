@@ -12,6 +12,7 @@ import {
 } from "../engine/holdem";
 import { llmHoldemDecision, type LlmConfig } from "../engine/llm";
 import { agentById, pickAgents, recordResult, store } from "../store";
+import { checkAgents, configForAgent, type AgentConnResult } from "../utils/llmCheck";
 
 const game = ref<HoldemGame | null>(null);
 const state = ref<HoldemState | null>(null);
@@ -100,11 +101,10 @@ function flyChip(fromId: number, kind: "bet" | "win") {
 }
 
 // ===== Agent 解析 =====
-function buildAgents() {
-  const list =
-    store.startAgents && store.startAgents.length ? store.startAgents.slice(0, 8) : pickAgents(5);
-  agentIdsList.value = list;
-}
+// 开局前的大模型连通性检查
+const connChecking = ref(false);
+const connErrors = ref<AgentConnResult[]>([]);
+const lastList = ref<string[]>([]);
 const agentMap = computed(() => {
   const m: Record<number, string> = {};
   agentIdsList.value.forEach((id, i) => (m[i + 1] = id));
@@ -118,15 +118,7 @@ function styleFor(id: number): AgentStyle {
   return { aggression: a?.aggression ?? 0.5, tightness: a?.tightness ?? 0.5 };
 }
 function llmConfigFor(id: number): LlmConfig {
-  const a = agentFor(id);
-  return {
-    enabled: store.settings.enabled,
-    baseUrl: a?.baseUrl ?? store.settings.baseUrl,
-    apiKey: a?.apiKey ?? store.settings.apiKey,
-    model: a?.model ?? store.settings.model,
-    persona: a?.persona ?? store.settings.persona,
-    temperature: store.settings.temperature,
-  };
+  return configForAgent(agentFor(id));
 }
 function holdemLabel(c: Card): string {
   return SUIT_SYMBOL[c.suit] + rankLabel(c);
@@ -134,19 +126,29 @@ function holdemLabel(c: Card): string {
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
-function newGame() {
-  buildAgents();
-  const ids = agentIdsList.value;
-  const names = ids.map(id => agentById(id)?.name ?? "机器人");
-  const agentIds = [undefined, ...ids];
-  game.value = new HoldemGame({ names, agentIds });
-  state.value = game.value.getState();
-  raiseOpen.value = false;
-  winHandledForHand = -1;
-  paused = false;
-  store.activeGame = "holdem";
-  sfx.deal();
-  driveBots();
+/** 开局入口：启用大模型时先检查牌桌上所有 agent 的连接，全部通过才真正开局 */
+async function requestNewGame(ids?: string[]) {
+  const list =
+    ids && ids.length
+      ? ids.slice(0, 8)
+      : store.startAgents && store.startAgents.length
+        ? store.startAgents.slice(0, 8)
+        : pickAgents(5);
+  agentIdsList.value = list;
+  lastList.value = list;
+  if (store.settings.enabled) {
+    connChecking.value = true;
+    connErrors.value = [];
+    const res = await checkAgents(list);
+    connChecking.value = false;
+    const bad = res.filter((r) => !r.ok);
+    if (bad.length) {
+      connErrors.value = bad;
+      sfx.lose();
+      return; // 连接失败：不开始牌局
+    }
+  }
+  buildAgentsFromList(list);
 }
 
 // 加减对手（重新发牌）
@@ -155,14 +157,12 @@ function addBot() {
   const more = pickAgents(1, agentIdsList.value);
   if (!more.length) return;
   sfx.click();
-  agentIdsList.value = [...agentIdsList.value, ...more];
-  buildAgentsFromList(agentIdsList.value);
+  requestNewGame([...agentIdsList.value, ...more]);
 }
 function removeBot() {
   if (agentIdsList.value.length <= 2) return;
   sfx.click();
-  agentIdsList.value = agentIdsList.value.slice(0, -1);
-  buildAgentsFromList(agentIdsList.value);
+  requestNewGame(agentIdsList.value.slice(0, -1));
 }
 function buildAgentsFromList(list: string[]) {
   const names = list.map(id => agentById(id)?.name ?? "机器人");
@@ -176,16 +176,12 @@ function buildAgentsFromList(list: string[]) {
   driveBots();
 }
 
-function maybeStart() {
+async function maybeStart() {
   if (store.pendingNewGame === "holdem") {
     store.pendingNewGame = null;
-    const ids =
-      store.startAgents && store.startAgents.length ? store.startAgents.slice(0, 8) : pickAgents(5);
-    agentIdsList.value = ids;
-    buildAgentsFromList(ids);
+    await requestNewGame();
   } else if (!game.value) {
-    agentIdsList.value = pickAgents(5);
-    buildAgentsFromList(agentIdsList.value);
+    await requestNewGame();
   } else {
     paused = false;
     resumeIfNeeded();
@@ -348,6 +344,12 @@ function backToPlaza() {
   store.view = "plaza";
 }
 
+function goSettings() {
+  sfx.click();
+  paused = true;
+  store.view = "settings";
+}
+
 const humanWon = computed(() => state.value?.winners.includes(0) ?? false);
 
 onMounted(maybeStart);
@@ -393,7 +395,7 @@ onDeactivated(() => {
         >
           ➖
         </button>
-        <button class="btn-ghost rounded-lg px-3 py-1.5 text-sm" @click="newGame">重开</button>
+        <button class="btn-ghost rounded-lg px-3 py-1.5 text-sm" @click="requestNewGame()">重开</button>
       </div>
     </header>
 
@@ -563,10 +565,60 @@ onDeactivated(() => {
           {{ state?.resultText || (humanBust ? "筹码已归零，无法继续" : "有玩家筹码耗尽") }}
         </div>
         <div class="flex justify-center gap-3">
-          <button class="btn btn-primary px-6 py-2.5" @click="newGame">重开一局</button>
+          <button class="btn btn-primary px-6 py-2.5" @click="requestNewGame()">重开一局</button>
           <button class="btn-ghost rounded-xl px-6 py-2.5 text-sm" @click="backToPlaza">
             {{ humanBust ? "退出牌局" : "返回广场" }}
           </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 开局前：大模型连通性检测中 -->
+    <div
+      v-if="connChecking"
+      class="absolute inset-0 z-[70] flex items-center justify-center bg-black/70 backdrop-blur-sm"
+    >
+      <div
+        class="flex flex-col items-center gap-3 rounded-2xl border border-white/15 bg-slate-900/90 px-8 py-6 shadow-2xl"
+      >
+        <div class="text-3xl">🔌</div>
+        <div class="text-sm text-white/80">正在检测牌桌上所有 AI 对手的大模型连接…</div>
+        <span class="flex gap-1"
+          ><i class="thinking-dot h-2 w-2 rounded-full bg-amber-300"></i
+          ><i class="thinking-dot h-2 w-2 rounded-full bg-amber-300" style="animation-delay: 0.18s"></i
+          ><i class="thinking-dot h-2 w-2 rounded-full bg-amber-300" style="animation-delay: 0.36s"></i
+        ></span>
+      </div>
+    </div>
+
+    <!-- 开局前：有 agent 连接失败，禁止开始 -->
+    <div
+      v-if="connErrors.length && !connChecking"
+      class="absolute inset-0 z-[70] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+    >
+      <div
+        class="w-[460px] max-w-[92vw] rounded-2xl border-2 border-rose-400/70 bg-gradient-to-b from-slate-800 to-slate-900 p-6 text-center shadow-2xl"
+      >
+        <div class="mb-1 text-4xl">🔌</div>
+        <div class="mb-1 text-xl font-black text-rose-200">大模型连接失败，无法开始牌局</div>
+        <div class="mb-4 text-sm text-white/70">以下 AI 对手无法连通其大模型，请检查 Key / 接口地址：</div>
+        <div class="mb-4 max-h-52 space-y-2 overflow-y-auto text-left">
+          <div
+            v-for="e in connErrors"
+            :key="e.id"
+            class="rounded-lg border border-rose-400/30 bg-black/40 px-3 py-2"
+          >
+            <div class="text-sm font-bold text-white">{{ e.name }}</div>
+            <div class="text-xs text-rose-200/90">{{ e.error }}</div>
+          </div>
+        </div>
+        <div class="mb-4 text-xs text-white/45">
+          提示：到「设置」修正 API Key，或关闭大模型改用内置规则引擎。
+        </div>
+        <div class="flex flex-wrap justify-center gap-3">
+          <button class="btn btn-slate px-5 py-2 text-sm" @click="requestNewGame(lastList)">重试</button>
+          <button class="btn btn-ghost px-5 py-2 text-sm" @click="goSettings">去设置</button>
+          <button class="btn btn-primary px-5 py-2 text-sm" @click="backToPlaza">返回广场</button>
         </div>
       </div>
     </div>

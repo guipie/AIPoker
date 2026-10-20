@@ -2,6 +2,7 @@
 import { ref, watch } from "vue";
 import { store, saveSettings } from "../store";
 import { sfx, setSoundEnabled, isSoundEnabled } from "../audio/sfx";
+import { testLlmConnection, type LlmConfig } from "../engine/llm";
 
 const draft = ref({ ...store.settings, sound: store.settings.sound ?? true });
 
@@ -26,11 +27,41 @@ function applyPreset(p: (typeof presets)[number]) {
   sfx.click();
 }
 
-function save() {
+// ===== 连接检测 =====
+const testing = ref(false);
+const testMsg = ref<{ ok: boolean; text: string } | null>(null);
+
+/** 校验当前草稿里的 Key/接口是否可用；返回是否通过 */
+async function testConnection(): Promise<boolean> {
+  testing.value = true;
+  testMsg.value = { ok: true, text: "正在检测大模型连接…" };
+  const cfg: LlmConfig = {
+    enabled: draft.value.enabled,
+    baseUrl: draft.value.baseUrl,
+    model: draft.value.model,
+    apiKey: draft.value.apiKey,
+    persona: draft.value.persona,
+    temperature: draft.value.temperature,
+  };
+  const r = await testLlmConnection(cfg);
+  testing.value = false;
+  testMsg.value = r.ok
+    ? { ok: true, text: "✅ 连接成功，API Key 有效" }
+    : { ok: false, text: "❌ " + r.error };
+  return r.ok;
+}
+
+async function save() {
+  sfx.click();
+  // 启用大模型时，保存前必须先验证 Key 是否正确；关闭时直接保存（作为连接失败时的退路）
+  if (draft.value.enabled) {
+    const ok = await testConnection();
+    if (!ok) return; // Key 不正确 → 拒绝保存
+  }
   store.settings = { ...draft.value };
   saveSettings();
   setSoundEnabled(draft.value.sound);
-  sfx.click();
+  testMsg.value = { ok: true, text: "✅ 设置已保存" };
 }
 </script>
 
@@ -105,13 +136,27 @@ function save() {
           </div>
         </div>
 
-        <div class="flex justify-end pt-2">
-          <button class="btn btn-primary px-6 py-2.5" @click="save">保存设置</button>
+        <div
+          v-if="testMsg"
+          class="rounded-lg px-3 py-2 text-xs"
+          :class="testMsg.ok ? 'bg-emerald-500/20 text-emerald-200' : 'bg-rose-500/20 text-rose-200'"
+        >
+          {{ testMsg.text }}
+        </div>
+
+        <div class="flex justify-end gap-3 pt-2">
+          <button class="btn btn-slate px-5 py-2.5" :disabled="testing" @click="testConnection">
+            {{ testing ? "检测中…" : "🔌 测试连接" }}
+          </button>
+          <button class="btn btn-primary px-6 py-2.5" :disabled="testing" @click="save">
+            {{ testing ? "检测中…" : "保存设置" }}
+          </button>
         </div>
       </div>
 
       <p class="mt-4 text-center text-[11px] text-amber-100/30">
-        提示：每个 Agent 可在「Agent 广场」单独指定模型与人设，覆盖这里的全局设置。
+        提示：启用大模型或填写了 API Key 后，保存前会自动校验 Key 是否正确，校验失败将无法保存。<br />
+        每个 Agent 可在「Agent 广场」单独指定模型与人设，覆盖这里的全局设置。
       </p>
     </div>
   </div>

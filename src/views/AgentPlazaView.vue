@@ -2,6 +2,7 @@
 import { ref, reactive, computed } from "vue";
 import { store, allAgents, agentById, toggleDefault, addCustomAgent, beginGame, type AgentDef } from "../store";
 import { sfx } from "../audio/sfx";
+import { testLlmConnection, type LlmConfig } from "../engine/llm";
 
 const agents = computed(() => allAgents());
 const selected = computed(() => new Set(store.selectedAgentIds));
@@ -89,11 +90,35 @@ function openModal() {
   showModal.value = true;
 }
 
-function saveCustom() {
+const saving = ref(false);
+
+async function saveCustom() {
   if (!form.name.trim()) {
     formError.value = "请填写名称";
     return;
   }
+  // 该 agent 实际会使用的大模型配置（未填则回落到全局设置）
+  const cfg: LlmConfig = {
+    enabled: store.settings.enabled,
+    baseUrl: form.baseUrl.trim() || store.settings.baseUrl,
+    model: form.model.trim() || store.settings.model,
+    apiKey: form.apiKey.trim() || store.settings.apiKey,
+    persona: "",
+    temperature: store.settings.temperature,
+  };
+  // 启用大模型或已填 Key 时，先验证能否连通，失败则不允许添加
+  if (store.settings.enabled || cfg.apiKey) {
+    saving.value = true;
+    formError.value = "正在检测大模型连接…";
+    const r = await testLlmConnection(cfg);
+    saving.value = false;
+    if (!r.ok) {
+      formError.value = "大模型连接失败：" + r.error;
+      return;
+    }
+    formError.value = "";
+  }
+
   const id = "custom-" + Date.now().toString(36);
   const [c1, c2] = COLORS[Math.floor(Math.random() * COLORS.length)];
   const a: AgentDef = {
@@ -268,8 +293,10 @@ function saveCustom() {
           </div>
 
           <div class="mt-5 flex justify-end gap-3">
-            <button class="btn-ghost rounded-xl px-5 py-2 text-sm" @click="showModal = false">取消</button>
-            <button class="btn btn-primary px-6 py-2 text-sm" @click="saveCustom">保存并添加</button>
+            <button class="btn-ghost rounded-xl px-5 py-2 text-sm" :disabled="saving" @click="showModal = false">取消</button>
+            <button class="btn btn-primary px-6 py-2 text-sm" :disabled="saving" @click="saveCustom">
+              {{ saving ? "检测中…" : "保存并添加" }}
+            </button>
           </div>
         </div>
       </div>

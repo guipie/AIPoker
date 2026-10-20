@@ -24,6 +24,13 @@ export interface DdzPlayer {
 
 export type DdzPhase = "bidding" | "playing" | "gameover";
 
+/** 一次出牌动作记录（用于复盘/给大模型描述“上家出了什么”） */
+export interface DdzAction {
+  playerId: number;
+  type: "play" | "pass";
+  cards: Card[] | null;
+}
+
 export interface DdzState {
   phase: DdzPhase;
   players: DdzPlayer[];
@@ -37,6 +44,8 @@ export interface DdzState {
   bidHistory: { playerId: number; score: number }[];
   currentBid: number;
   message: string;
+  // 最近若干次动作（按时间顺序，含“不出”），供 UI 与大模型了解场上形势
+  recentActions: DdzAction[];
   // 叫地主轮次内部状态
   biddingOrder: number[];
   bidPtr: number;
@@ -403,6 +412,7 @@ export class DoudizhuGame {
   private bidPtr = 0;
   private redealCount = 0;
   private message = "";
+  private actions: DdzAction[] = [];
 
   constructor(names: string[], humanName = "你", noJokers = false) {
     // names 为机器人名字列表；人类固定为 0 号并置于最前，
@@ -444,6 +454,7 @@ export class DoudizhuGame {
     this.lastPlayerId = null;
     this.passCount = 0;
     this.winner = null;
+    this.actions = [];
     // 随机先叫，按人数生成叫分顺序
     const first = Math.floor(Math.random() * this.players.length);
     const n = this.players.length;
@@ -514,6 +525,7 @@ export class DoudizhuGame {
       if (!canBeat(pattern, lastPattern)) return this.getState(); // 压不过
     }
     // 执行出牌
+    this.actions.push({ playerId, type: "play", cards });
     const idSet = new Set(cardIds);
     player.hand = player.hand.filter((c) => !idSet.has(c.id));
     player.handCount = player.hand.length;
@@ -540,6 +552,7 @@ export class DoudizhuGame {
     if (this.currentPlayerId !== playerId) return this.getState();
     if (this.lastPlay === null) return this.getState(); // 自由出牌不能不出
     this.passCount++;
+    this.actions.push({ playerId, type: "pass", cards: null });
     // 不出不改变各座位前已展示的出牌（覆盖式更新仅发生在再次出牌时）
     if (this.passCount >= this.players.length - 1) {
       // 其他人都过，由上一手出牌者重新领出
@@ -582,6 +595,7 @@ export class DoudizhuGame {
       biddingOrder: [...this.biddingOrder],
       bidPtr: this.bidPtr,
       redealCount: this.redealCount,
+      recentActions: this.actions.slice(-8).map((a) => ({ ...a, cards: a.cards ? [...a.cards] : null })),
     };
   }
 }

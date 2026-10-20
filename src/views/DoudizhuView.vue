@@ -15,6 +15,7 @@ import {
 } from "../engine/doudizhu";
 import { llmDdzDecision, type LlmConfig } from "../engine/llm";
 import { agentById, pickAgents, recordResult, store } from "../store";
+import { checkAgents, configForAgent, type AgentConnResult } from "../utils/llmCheck";
 
 const game = ref<DoudizhuGame | null>(null);
 const state = ref<any>(null);
@@ -22,6 +23,11 @@ const selectedIds = ref<Set<string>>(new Set());
 const busy = ref(false);
 const thinkingId = ref<number | null>(null);
 const agentIds = ref<string[]>([]);
+
+// 开局前的大模型连通性检查
+const connChecking = ref(false);
+const connErrors = ref<AgentConnResult[]>([]);
+const lastList = ref<string[]>([]);
 
 let running = false;
 let paused = false;
@@ -55,20 +61,69 @@ function agentFor(id: number) {
   return agentById(agentMap.value[id] ?? "");
 }
 function llmConfigFor(id: number): LlmConfig {
-  const a = agentFor(id);
-  return {
-    enabled: store.settings.enabled,
-    baseUrl: a?.baseUrl ?? store.settings.baseUrl,
-    apiKey: a?.apiKey ?? store.settings.apiKey,
-    model: a?.model ?? store.settings.model,
-    persona: a?.persona ?? store.settings.persona,
-    temperature: store.settings.temperature,
-  };
+  return configForAgent(agentFor(id));
 }
 
 function ddzLabel(c: Card): string {
   if (c.suit === "joker") return c.rank === 17 ? "大王" : "小王";
   return SUIT_SYMBOL[c.suit] + rankLabel(c);
+}
+
+function roleText(r: string | null | undefined): string {
+  return r === "landlord" ? "地主" : r === "farmer" ? "农民" : "未定";
+}
+
+/** 相对“我”的方位：下家 / 上家 / 对家（4 人局） */
+function relationOf(pid: number, myId: number, n: number): string {
+  const delta = (pid - myId + n) % n;
+  if (delta === 0) return "";
+  if (delta === 1) return "下家";
+  if (delta === n - 1) return "上家";
+  if (n === 4 && delta === 2) return "对家";
+  return "";
+}
+
+/** 组装给大模型的完整牌局上下文：地主 / 队友 / 各家剩牌 / 上家最近出牌结果 */
+function buildDdzInput(s: any, player: any) {
+  const n = s.players.length;
+  const landlord = s.players.find((p: any) => p.role === "landlord") ?? null;
+  const myRole = player.role;
+  const teammates =
+    myRole === "farmer"
+      ? s.players.filter((p: any) => p.role === "farmer" && p.id !== player.id).map((p: any) => p.name)
+      : [];
+  const opponents =
+    myRole === "landlord"
+      ? s.players.filter((p: any) => p.id !== player.id).map((p: any) => p.name)
+      : landlord
+        ? [landlord.name]
+        : [];
+
+  const seats = s.players.map((p: any) => ({
+    name: p.id === player.id ? `${p.name}（我）` : p.name,
+    role: roleText(p.role),
+    handCount: p.handCount,
+    relation: relationOf(p.id, player.id, n),
+  }));
+
+  const recentActions = (s.recentActions ?? []).map((a: any) => {
+    const who = s.players[a.playerId]?.name ?? "?";
+    return a.type === "pass" ? `${who}：不出` : `${who}：出 ${(a.cards ?? []).map(ddzLabel).join(" ")}`;
+  });
+
+  return {
+    hand: player.hand.map(ddzLabel),
+    lastPlay: s.lastPlay ? s.lastPlay.map(ddzLabel) : null,
+    lastPlayerName: s.lastPlayerId != null ? (s.players[s.lastPlayerId]?.name ?? null) : null,
+    freeLead: !s.lastPlay,
+    myRole: roleText(myRole),
+    landlordName: landlord ? landlord.name : "（尚未确定）",
+    teammates,
+    opponents,
+    seats,
+    recentActions,
+    persona: agentFor(player.id)?.persona,
+  };
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -88,28 +143,47 @@ function newGame(ids?: string[]) {
   driveBots();
 }
 
+/** 开局入口：启用大模型时先检查牌桌上所有 agent 的连接，全部通过才真正开局 */
+async function requestNewGame(ids?: string[]) {
+  const list = ids && ids.length ? ids.slice(0, 3) : pickAgents(2);
+  lastList.value = list;
+  if (store.settings.enabled) {
+    connChecking.value = true;
+    connErrors.value = [];
+    const res = await checkAgents(list);
+    connChecking.value = false;
+    const bad = res.filter((r) => !r.ok);
+    if (bad.length) {
+      connErrors.value = bad;
+      sfx.lose();
+      return; // 连接失败：不开始牌局
+    }
+  }
+  newGame(list);
+}
+
 // 加减机器人（重置发牌）
 function addBot() {
   if (agentIds.value.length >= 3) return;
   const more = pickAgents(1, agentIds.value);
   if (more.length === 0) return;
   sfx.click();
-  newGame([...agentIds.value, ...more]);
+  requestNewGame([...agentIds.value, ...more]);
 }
 function removeBot() {
   if (agentIds.value.length <= 2) return;
   sfx.click();
-  newGame(agentIds.value.slice(0, -1));
+  requestNewGame(agentIds.value.slice(0, -1));
 }
 
-function maybeStart() {
+async function maybeStart() {
   if (store.pendingNewGame === "doudizhu") {
     store.pendingNewGame = null;
     const ids =
       store.startAgents && store.startAgents.length ? store.startAgents.slice(0, 3) : pickAgents(2);
-    newGame(ids);
+    await requestNewGame(ids);
   } else if (!game.value) {
-    newGame(pickAgents(2));
+    await requestNewGame(pickAgents(2));
   } else {
     paused = false;
     resumeIfNeeded();
@@ -141,12 +215,7 @@ async function driveBots() {
         let ids: string[] | null = null;
         if (store.settings.enabled && (store.settings.apiKey || agentFor(player.id)?.apiKey)) {
           try {
-            const out = await llmDdzDecision(llmConfigFor(player.id), {
-              hand: player.hand.map(ddzLabel),
-              lastPlay: s.lastPlay ? s.lastPlay.map(ddzLabel) : null,
-              myRole: player.role ?? "未知",
-              persona: agentFor(player.id)?.persona,
-            });
+            const out = await llmDdzDecision(llmConfigFor(player.id), buildDdzInput(s, player));
             if (out) {
               const map = new Map(player.hand.map((c: Card) => [ddzLabel(c), c.id]));
               if (out.play)
@@ -282,6 +351,12 @@ function backToPlaza() {
   store.view = "plaza";
 }
 
+function goSettings() {
+  sfx.click();
+  paused = true;
+  store.view = "settings";
+}
+
 // 对手座位定位：你（人类）在底部，对手沿上弧排开
 // 2 个对手 → 左上 / 右上；3 个对手 → 左上 / 上中(对面) / 右上
 function botStyle(i: number, n: number) {
@@ -347,7 +422,7 @@ onDeactivated(() => {
         >
           ➖
         </button>
-        <button class="btn-ghost rounded-lg px-3 py-1.5 text-sm" @click="newGame()">重开</button>
+        <button class="btn-ghost rounded-lg px-3 py-1.5 text-sm" @click="requestNewGame()">重开</button>
       </div>
     </header>
 
@@ -368,15 +443,15 @@ onDeactivated(() => {
 
           <!-- 机器人座位（你在对面下方，对手环绕桌面上方） -->
           <div
-            v-for="(p, i) in bots"
+            v-for="(p, index) in bots"
             :key="p.id"
             class="absolute"
-            :style="botStyle(i, bots.length)"
+            :style="botStyle(Number(index), bots.length)"
           >
             <div
               class="mb-0.5 rounded-full bg-black/55 px-2 py-0.5 text-[10px] font-bold tracking-wide text-amber-200 shadow"
             >
-              {{ positionLabel(i, bots.length) }}
+              {{ positionLabel(Number(index), bots.length) }}
             </div>
             <DoudizhuSeat :player="p" :agent="agentFor(p.id)" :is-current="thinkingId === p.id" />
           </div>
@@ -389,7 +464,7 @@ onDeactivated(() => {
             >
               <span class="text-[11px] tracking-widest text-amber-200/70">地主底牌</span>
               <div class="flex gap-1">
-                <CardComp v-for="c in state.landlordCards" :key="c.id" :card="c" small />
+                <CardComp v-for="c in state.landlordCards" :key="c.id" :card="c" size="sm" />
               </div>
             </div>
 
@@ -551,7 +626,7 @@ onDeactivated(() => {
             · 你是{{ me?.role === "landlord" ? "地主" : "农民" }}
           </span>
         </div>
-        <button class="btn btn-primary px-8 py-2.5" @click="newGame()">再来一局</button>
+        <button class="btn btn-primary px-8 py-2.5" @click="requestNewGame()">再来一局</button>
       </div>
       <div v-if="iWin" class="pointer-events-none absolute inset-0 overflow-hidden">
         <span
@@ -565,6 +640,56 @@ onDeactivated(() => {
             animationDelay: (n % 7) * 0.12 + 's',
           }"
         ></span>
+      </div>
+    </div>
+
+    <!-- 开局前：大模型连通性检测中 -->
+    <div
+      v-if="connChecking"
+      class="absolute inset-0 z-[70] flex items-center justify-center bg-black/70 backdrop-blur-sm"
+    >
+      <div
+        class="flex flex-col items-center gap-3 rounded-2xl border border-white/15 bg-slate-900/90 px-8 py-6 shadow-2xl"
+      >
+        <div class="text-3xl">🔌</div>
+        <div class="text-sm text-white/80">正在检测牌桌上所有 AI 对手的大模型连接…</div>
+        <span class="flex gap-1"
+          ><i class="thinking-dot h-2 w-2 rounded-full bg-amber-300"></i
+          ><i class="thinking-dot h-2 w-2 rounded-full bg-amber-300" style="animation-delay: 0.18s"></i
+          ><i class="thinking-dot h-2 w-2 rounded-full bg-amber-300" style="animation-delay: 0.36s"></i
+        ></span>
+      </div>
+    </div>
+
+    <!-- 开局前：有 agent 连接失败，禁止开始 -->
+    <div
+      v-if="connErrors.length && !connChecking"
+      class="absolute inset-0 z-[70] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+    >
+      <div
+        class="w-[460px] max-w-[92vw] rounded-2xl border-2 border-rose-400/70 bg-gradient-to-b from-slate-800 to-slate-900 p-6 text-center shadow-2xl"
+      >
+        <div class="mb-1 text-4xl">🔌</div>
+        <div class="mb-1 text-xl font-black text-rose-200">大模型连接失败，无法开始牌局</div>
+        <div class="mb-4 text-sm text-white/70">以下 AI 对手无法连通其大模型，请检查 Key / 接口地址：</div>
+        <div class="mb-4 max-h-52 space-y-2 overflow-y-auto text-left">
+          <div
+            v-for="e in connErrors"
+            :key="e.id"
+            class="rounded-lg border border-rose-400/30 bg-black/40 px-3 py-2"
+          >
+            <div class="text-sm font-bold text-white">{{ e.name }}</div>
+            <div class="text-xs text-rose-200/90">{{ e.error }}</div>
+          </div>
+        </div>
+        <div class="mb-4 text-xs text-white/45">
+          提示：到「设置」修正 API Key，或关闭大模型改用内置规则引擎。
+        </div>
+        <div class="flex flex-wrap justify-center gap-3">
+          <button class="btn btn-slate px-5 py-2 text-sm" @click="requestNewGame(lastList)">重试</button>
+          <button class="btn btn-ghost px-5 py-2 text-sm" @click="goSettings">去设置</button>
+          <button class="btn btn-primary px-5 py-2 text-sm" @click="backToPlaza">返回广场</button>
+        </div>
       </div>
     </div>
   </div>
