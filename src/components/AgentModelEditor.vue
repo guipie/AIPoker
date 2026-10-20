@@ -42,23 +42,26 @@ watch(
 async function save() {
   const t = target.value;
   if (!t) return;
-  testing.value = true;
-  msgOk.value = true;
-  msg.value = "正在检测大模型连接…";
-  const cfg: LlmConfig = {
-    enabled: store.settings.enabled,
-    baseUrl: form.baseUrl.trim() || store.settings.baseUrl,
-    model: form.model.trim() || store.settings.model,
-    apiKey: form.apiKey.trim() || store.settings.apiKey,
-    persona: t.persona ?? "",
-    temperature: store.settings.temperature,
-  };
-  const r = await testLlmConnection(cfg);
-  testing.value = false;
-  if (!r.ok) {
-    msgOk.value = false;
-    msg.value = "大模型连接失败：" + r.error;
-    return;
+  // 仅在启用大模型时才做连通性校验；未启用时直接保存（不与“规则 AI 也能玩”冲突）
+  if (store.settings.enabled) {
+    testing.value = true;
+    msgOk.value = true;
+    msg.value = "正在检测大模型连接…";
+    const cfg: LlmConfig = {
+      enabled: store.settings.enabled,
+      baseUrl: form.baseUrl.trim() || store.settings.baseUrl,
+      model: form.model.trim() || store.settings.model,
+      apiKey: form.apiKey.trim() || store.settings.apiKey,
+      persona: t.persona ?? "",
+      temperature: store.settings.temperature,
+    };
+    const r = await testLlmConnection(cfg);
+    testing.value = false;
+    if (!r.ok) {
+      msgOk.value = false;
+      msg.value = "大模型连接失败：" + r.error;
+      return;
+    }
   }
   msg.value = "";
   if (t.isCustom) updateCustomAgent(t.id, { ...form });

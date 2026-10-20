@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onActivated, onDeactivated, onMounted, ref } from "vue";
+import { computed, nextTick, onActivated, onDeactivated, onMounted, ref, watch } from "vue";
 import { sfx } from "../audio/sfx";
 import CardComp from "../components/Card.vue";
 import HoldemSeat from "../components/HoldemSeat.vue";
@@ -150,10 +150,24 @@ async function requestNewGame(ids?: string[]) {
     }
     applyOnline(res); // 记录各 agent 的在线状态
   } else {
+    // 未启用大模型：不做任何连通性判断，同时清掉上一次留下的错误遮罩
     agentOnline.value = {};
+    connErrors.value = [];
   }
   buildAgentsFromList(list);
 }
+
+// 关闭大模型后，立刻清掉残留的“连接失败/去设置”提示（keep-alive 会保留下次仍是旧状态）
+watch(
+  () => store.settings.enabled,
+  (on) => {
+    if (!on) {
+      connErrors.value = [];
+      connChecking.value = false;
+      agentOnline.value = {};
+    }
+  },
+);
 
 // 加减对手（重新发牌）
 function addBot() {
@@ -690,7 +704,7 @@ onDeactivated(() => {
 
     <!-- 开局前：有 agent 连接失败，禁止开始 -->
     <div
-      v-if="connErrors.length && !connChecking"
+      v-if="store.settings.enabled && connErrors.length && !connChecking"
       class="absolute inset-0 z-[70] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
     >
       <div

@@ -1,9 +1,16 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from "vue";
 import { sfx } from "../audio/sfx";
-import { testLlmConnection, type LlmConfig } from "../engine/llm";
 import AgentModelEditor from "../components/AgentModelEditor.vue";
-import { addCustomAgent, allAgents, beginGame, store, toggleDefault, type AgentDef } from "../store";
+import { testLlmConnection, type LlmConfig } from "../engine/llm";
+import {
+  addCustomAgent,
+  allAgents,
+  beginGame,
+  store,
+  toggleDefault,
+  type AgentDef,
+} from "../store";
 
 const agents = computed(() => allAgents());
 const selected = computed(() => new Set(store.selectedAgentIds));
@@ -122,8 +129,8 @@ async function saveCustom() {
     persona: "",
     temperature: store.settings.temperature,
   };
-  // 启用大模型或已填 Key 时，先验证能否连通，失败则不允许添加
-  if (store.settings.enabled || cfg.apiKey) {
+  // 仅在启用大模型时才校验连通性；未启用时直接保存（不影响规则 AI 玩牌）
+  if (store.settings.enabled) {
     saving.value = true;
     formError.value = "正在检测大模型连接…";
     const r = await testLlmConnection(cfg);
@@ -308,6 +315,11 @@ async function saveCustom() {
           <div class="mt-3 flex items-center justify-between gap-2">
             <button
               class="min-w-0 truncate rounded-full bg-black/40 px-2 py-1 text-[10px] text-emerald-200/80 transition-colors hover:bg-black/60 hover:text-amber-200"
+            >
+              模型：{{ a.model ?? "全局设置" }}
+            </button>
+            <button
+              class="min-w-0 truncate rounded-full px-2 py-1 text-[10px] transition-colors hover:bg-black/60 hover:text-amber-200"
               :title="
                 a.isCustom
                   ? '修改该模型的接口/Key/模型名'
@@ -315,7 +327,7 @@ async function saveCustom() {
               "
               @click.stop="openEdit(a)"
             >
-              ✏️ 模型：{{ a.model ?? "全局设置" }}
+              ✏️
               <span v-if="a.baseUrl" class="text-amber-200/70">· 自定义接口</span>
               <span
                 v-if="store.agentOverrides[a.id]"
@@ -324,7 +336,7 @@ async function saveCustom() {
                 已改
               </span>
             </button>
-            <span
+            <!-- <span
               class="shrink-0 text-xs"
               :class="selected.has(a.id) ? 'text-amber-300' : 'text-white/40'"
             >
@@ -335,7 +347,7 @@ async function saveCustom() {
                     ? "默认 ★"
                     : "点击选择"
               }}
-            </span>
+            </span> -->
           </div>
         </div>
       </div>
