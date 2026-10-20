@@ -226,6 +226,7 @@ async function driveBots() {
       const player = s.players[id];
       let action: "fold" | "check" | "call" | "raise" = "check";
       let raiseTo: number | undefined;
+      let llmUsed = false; // LLM 是否正常返回了决策（失败则回退规则 AI，而不是默认 check→call）
 
       if (store.settings.enabled && (store.settings.apiKey || agentFor(id)?.apiKey)) {
         const aid = agentMap.value[id];
@@ -258,6 +259,7 @@ async function driveBots() {
           if (out) {
             action = out.action;
             raiseTo = out.raiseTo;
+            llmUsed = true; // 尊重 LLM 的决策（含 fold/check），失败才走规则兜底
           }
           if (aid && !llmErr) markOnline(aid);
         } catch (e: any) {
@@ -270,7 +272,8 @@ async function driveBots() {
       if (action === "raise" && (raiseTo == null || raiseTo <= s.currentBet))
         action = s.toCall > 0 ? "call" : "check";
 
-      if (!store.settings.enabled || !store.settings.apiKey) {
+      if (!llmUsed) {
+        // 未启用大模型，或 LLM 调用/解析失败 → 规则 AI 兜底
         const a = suggestHoldemAction(s, id, styleFor(id));
         action = a.type;
         raiseTo = a.toAmount;

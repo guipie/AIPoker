@@ -234,11 +234,15 @@ async function driveBots() {
         sfx.chip();
         applyState(game.value!.bid(player.id, score));
       } else {
+        // LLM 决策：严格区分「LLM 明确选择不出」与「LLM 调用失败」，
+        // 否则 LLM 说“不压队友的牌”会被规则 AI 兜底强行出牌（bug：页面打出 6）
         let ids: string[] | null = null;
+        let llmPass = false; // LLM 明确决定不出
+        let llmUsed = false; // LLM 正常返回了决策（含“不出”）
         if (store.settings.enabled && (store.settings.apiKey || agentFor(player.id)?.apiKey)) {
+          const aid = agentMap.value[player.id];
+          let llmErr: string | null = null;
           try {
-            const aid = agentMap.value[player.id];
-            let llmErr: string | null = null;
             const out = await llmDdzDecision(
               llmConfigFor(player.id),
               buildDdzInput(s, player),
@@ -249,15 +253,24 @@ async function driveBots() {
             );
             if (aid && !llmErr) markOnline(aid);
             if (out) {
-              const map = new Map(player.hand.map((c: Card) => [ddzLabel(c), c.id]));
-              if (out.play)
+              llmUsed = true;
+              if (out.play && out.play.length) {
+                const map = new Map(player.hand.map((c: Card) => [ddzLabel(c), c.id]));
                 ids = out.play.map((l: string) => map.get(l)).filter(Boolean) as string[];
-              else ids = null;
+                if (!ids.length) {
+                  // 给出的牌在手牌里一张都对不上 → 视为调用失败，走规则兜底
+                  llmUsed = false;
+                  llmPass = false;
+                }
+              } else {
+                llmPass = true; // play 为 null/空 → 明确不出
+              }
             }
           } catch {
-            ids = null;
+            llmUsed = false;
           }
         }
+
         if (ids && ids.length) {
           const cards = ids.map(id => player.hand.find((c: Card) => c.id === id)!).filter(Boolean);
           const pat = detectPattern(cards);
@@ -265,11 +278,27 @@ async function driveBots() {
           if (pat && (!lastPat || canBeat(pat, lastPat))) {
             sfx.play();
             applyState(game.value!.play(player.id, ids));
-          } else {
+          } else if (lastPat) {
+            // 出的牌压不过/非法 → 不出（合法动作）
             sfx.fold();
             applyState(game.value!.pass(player.id));
+          } else {
+            // 自由领出但牌型非法 → 回退规则 AI 领出
+            const lead = suggestLead(player.hand);
+            sfx.play();
+            applyState(
+              game.value!.play(
+                player.id,
+                lead.map(c => c.id)
+              )
+            );
           }
+        } else if (llmPass && s.lastPlay) {
+          // 尊重 LLM 的「不出」决策（如不压队友的牌、保存实力）——不能被兜底覆盖
+          sfx.fold();
+          applyState(game.value!.pass(player.id));
         } else {
+          // LLM 失败 / 未启用 / 自由领出不能不出 → 规则 AI
           const last = s.lastPlay ? detectPattern(s.lastPlay) : null;
           if (!last) {
             const lead = suggestLead(player.hand);
