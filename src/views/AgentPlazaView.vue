@@ -95,7 +95,7 @@ function openModal() {
   form.avatar = "";
   form.baseUrl = store.settings.baseUrl || "https://api.deepseek.com/v1";
   form.apiKey = store.settings.apiKey || "";
-  form.model = store.settings.model || "deepseek-chat";
+  form.model = store.settings.model || "deepseek-flash";
   form.aggression = 0.5;
   form.tightness = 0.5;
   formError.value = "";
@@ -421,7 +421,7 @@ async function saveCustom() {
                 <input
                   v-model="form.model"
                   class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
-                  placeholder="deepseek-chat"
+                  placeholder="deepseek-flash"
                 />
               </div>
               <div>

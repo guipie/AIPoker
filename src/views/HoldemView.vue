@@ -12,8 +12,9 @@ import {
   type HoldemState,
 } from "../engine/holdem";
 import { llmHoldemDecision, type LlmConfig } from "../engine/llm";
-import { agentById, pickAgents, recordResult, store } from "../store";
-import { checkAgents, configForAgent, type AgentConnResult } from "../utils/llmCheck";
+import { agentById, addMatchLog, pickAgents, recordResult, store } from "../store";
+import { checkAgents, configForAgent, shouldUseLlm, type AgentConnResult } from "../utils/llmCheck";
+import { newLogId, type MatchLogEntry } from "../utils/matchLog";
 
 const game = ref<HoldemGame | null>(null);
 const state = ref<HoldemState | null>(null);
@@ -25,6 +26,23 @@ const agentIdsList = ref<string[]>([]);
 let running = false;
 let paused = false;
 let winHandledForHand = -1;
+
+// ===== 一手牌的明细记录（每手入库一次，可在战绩页查看） =====
+const matchEntries = ref<MatchLogEntry[]>([]);
+const lastLogId = ref<string | null>(null);
+let loggedHand = -1;
+function pushLog(e: MatchLogEntry) {
+  matchEntries.value.push(e);
+}
+
+/** 结算后跳到战绩页并直接打开本手复盘 */
+function viewMatchDetail() {
+  if (!lastLogId.value) return;
+  sfx.click();
+  paused = true;
+  store.pendingStatLogId = lastLogId.value;
+  store.view = "stats";
+}
 
 const me = computed(() => state.value?.players.find(p => p.isHuman) ?? null);
 const bots = computed(() => (state.value ? state.value.players.filter(p => !p.isHuman) : []));
@@ -188,6 +206,9 @@ function buildAgentsFromList(list: string[]) {
   state.value = game.value.getState();
   raiseOpen.value = false;
   winHandledForHand = -1;
+  matchEntries.value = [];
+  lastLogId.value = null;
+  loggedHand = -1;
   paused = false;
   store.activeGame = "holdem";
   sfx.deal();
@@ -228,7 +249,7 @@ async function driveBots() {
       let raiseTo: number | undefined;
       let llmUsed = false; // LLM 是否正常返回了决策（失败则回退规则 AI，而不是默认 check→call）
 
-      if (store.settings.enabled && (store.settings.apiKey || agentFor(id)?.apiKey)) {
+      if (shouldUseLlm(agentFor(id))) {
         const aid = agentMap.value[id];
         let llmErr: string | null = null;
         try {
@@ -288,7 +309,7 @@ async function driveBots() {
 
   if (state.value?.phase === "handover") {
     const win = state.value.winners.includes(0);
-    recordResult("holdem", win, win ? "你赢下底池！" : "这手你没赢");
+    finalizeHand(win);
     win ? sfx.win() : sfx.lose();
   }
 }
@@ -303,6 +324,8 @@ function resumeIfNeeded() {
 
 function applyAndSound(id: number, action: "fold" | "check" | "call" | "raise", raiseTo?: number) {
   const g = game.value!;
+  const p = state.value?.players[id];
+  const beforeCommitted = p?.committed ?? 0;
   if (action === "fold") {
     sfx.fold();
     state.value = g.fold(id);
@@ -318,7 +341,61 @@ function applyAndSound(id: number, action: "fold" | "check" | "call" | "raise", 
     state.value = g.raiseTo(id, raiseTo ?? g.getState().currentBet + g.getState().minRaise);
     flyChip(id, "bet");
   }
+  // 记录明细（弃牌/过牌/跟注/加注，带金额与街名）
+  if (p) {
+    const after = state.value;
+    const ap = after?.players[id];
+    const paid = Math.max(0, (ap?.committed ?? 0) - beforeCommitted);
+    let note = "弃牌";
+    if (action === "check") note = "过牌";
+    else if (action === "call") note = `跟注 ${paid}`;
+    else if (action === "raise") note = `加注到 ${after?.currentBet ?? raiseTo ?? ""}`;
+    pushLog({
+      kind: "act",
+      playerId: id,
+      playerName: p.name,
+      source: id === 0 ? "human" : "rule",
+      note: `${streetName(after?.phase)} · ${note} · 剩 ${ap?.stack ?? 0}`,
+    });
+  }
   checkWinFx();
+}
+
+function streetName(phase?: string): string {
+  if (phase === "preflop") return "翻前";
+  if (phase === "flop") return "翻牌";
+  if (phase === "turn") return "转牌";
+  if (phase === "river") return "河牌";
+  return "结算";
+}
+
+/** 一手牌结束：明细入库并挂到战绩记录上 */
+function finalizeHand(win: boolean) {
+  const s = state.value;
+  if (!s) return;
+  if (loggedHand === s.handNumber) return;
+  loggedHand = s.handNumber;
+  const text = win ? "你赢下底池！" : "这手你没赢";
+  const id = newLogId("holdem");
+  addMatchLog({
+    id,
+    mode: "holdem",
+    time: Date.now(),
+    result: win ? "胜" : "负",
+    summary: `第 ${s.handNumber} 手 · ${text}`,
+    players: s.players.map(p => p.name),
+    detail: {
+      kind: "holdem",
+      hole: (s.players[0]?.hole ?? []).map(holdemLabel),
+      community: (s.community ?? []).map(holdemLabel),
+      pot: s.pot,
+      winners: s.winners.map(w => s.players[w]?.name ?? `#${w}`),
+      players: s.players.map(p => ({ name: p.name, stack: p.stack })),
+    },
+    entries: [...matchEntries.value],
+  });
+  lastLogId.value = id;
+  recordResult("holdem", win, text, id);
 }
 
 function checkWinFx() {
@@ -357,6 +434,14 @@ function humanRaise(kind: "min" | "half" | "pot" | "allin") {
   sfx.bet();
   state.value = game.value!.raiseTo(0, to);
   flyChip(0, "bet");
+  const ap = state.value?.players[0];
+  pushLog({
+    kind: "act",
+    playerId: 0,
+    playerName: "你",
+    source: "human",
+    note: `${streetName(state.value?.phase)} · 加注到 ${state.value?.currentBet ?? to} · 剩 ${ap?.stack ?? 0}`,
+  });
   checkWinFx();
   busy.value = false;
   driveBots();
@@ -368,6 +453,7 @@ function nextHand() {
   state.value = game.value!.nextHand();
   raiseOpen.value = false;
   winHandledForHand = -1;
+  matchEntries.value = []; // 新的一手，明细重新开始记
   if (state.value.phase !== "matchover") driveBots();
 }
 
@@ -646,8 +732,11 @@ onDeactivated(() => {
           </button>
         </div>
       </div>
-      <div v-else-if="isHandOver && !isMatchOver" class="mt-2 flex justify-center">
+      <div v-else-if="isHandOver && !isMatchOver" class="mt-2 flex justify-center gap-3">
         <button class="btn btn-primary px-8 py-2.5" @click="nextHand">下一手 →</button>
+        <button v-if="lastLogId" class="btn btn-ghost px-5 py-2.5 text-sm" @click="viewMatchDetail">
+          🔍 本手明细
+        </button>
       </div>
       <div v-else class="mt-2 h-[52px]"></div>
     </footer>

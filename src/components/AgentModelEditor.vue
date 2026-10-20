@@ -1,6 +1,8 @@
 <!-- 修改某个 agent 的模型配置（baseUrl / Key / 模型名）——广场与牌桌共用 -->
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
+import { sfx } from "../audio/sfx";
+import { testLlmConnection, type LlmConfig } from "../engine/llm";
 import {
   agentById,
   clearAgentOverride,
@@ -8,8 +10,6 @@ import {
   store,
   updateCustomAgent,
 } from "../store";
-import { testLlmConnection, type LlmConfig } from "../engine/llm";
-import { sfx } from "../audio/sfx";
 
 const props = defineProps<{ open: boolean; agentId: string | null }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "saved", id: string): void }>();
@@ -36,7 +36,7 @@ watch(
       testing.value = false;
     }
   },
-  { immediate: true },
+  { immediate: true }
 );
 
 async function save() {
@@ -112,7 +112,7 @@ function reset() {
               <input
                 v-model="form.model"
                 class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
-                placeholder="如 deepseek-chat"
+                placeholder="如 deepseek-flash"
               />
             </div>
             <div>
@@ -129,7 +129,13 @@ function reset() {
           <div
             v-if="msg"
             class="rounded-lg px-3 py-2 text-xs"
-            :class="msgOk ? (testing ? 'bg-sky-500/20 text-sky-200' : 'bg-emerald-500/20 text-emerald-200') : 'bg-rose-500/20 text-rose-200'"
+            :class="
+              msgOk
+                ? testing
+                  ? 'bg-sky-500/20 text-sky-200'
+                  : 'bg-emerald-500/20 text-emerald-200'
+                : 'bg-rose-500/20 text-rose-200'
+            "
           >
             {{ msg }}
           </div>
@@ -145,7 +151,11 @@ function reset() {
           </button>
           <span v-else></span>
           <div class="flex gap-3">
-            <button class="btn-ghost rounded-xl px-5 py-2 text-sm" :disabled="testing" @click="emit('close')">
+            <button
+              class="btn-ghost rounded-xl px-5 py-2 text-sm"
+              :disabled="testing"
+              @click="emit('close')"
+            >
               取消
             </button>
             <button class="btn btn-primary px-6 py-2 text-sm" :disabled="testing" @click="save">

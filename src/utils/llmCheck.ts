@@ -19,6 +19,18 @@ export function configForAgentId(id: string): LlmConfig {
   return configForAgent(agentById(id));
 }
 
+/**
+ * 这个 agent 是否该走大模型：
+ * 全局已启用，并且要么配了 Key，要么是本地地址（Ollama / LM Studio 等本来就不需要 Key）。
+ * 之前只判断 apiKey，导致「用本地模型但没填 Key」的 agent 永远走规则 AI。
+ */
+export function shouldUseLlm(a: AgentDef | undefined): boolean {
+  if (!store.settings.enabled) return false;
+  const cfg = configForAgent(a);
+  if (cfg.apiKey) return true;
+  return /localhost|127\.0\.0\.1|0\.0\.0\.0|::1|host\.docker\.internal/i.test(cfg.baseUrl ?? "");
+}
+
 export interface AgentConnResult {
   id: string;
   name: string;

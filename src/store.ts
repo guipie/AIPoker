@@ -1,5 +1,10 @@
-// 中央状态：视图路由、LLM 设置、AI 对手档案库、默认/自定义 agent、牌桌选座、战绩统计。
+// 中央状态：视图路由、LLM 设置、AI 对手档案库、默认/自定义 agent、牌桌选座、战绩统计、对局日志。
 import { reactive } from "vue";
+import {
+  loadMatchLogs,
+  saveMatchLogs,
+  type MatchLog,
+} from "./utils/matchLog";
 
 export type ViewKey = "plaza" | "doudizhu" | "holdem" | "agents" | "stats" | "settings";
 export type GameMode = "doudizhu" | "holdem";
@@ -43,7 +48,7 @@ export const AGENTS: AgentDef[] = [
     tagline: "激进诈唬流",
     aggression: 0.88,
     tightness: 0.35,
-    model: "deepseek-chat",
+    model: "deepseek-flash",
     persona: "激进好斗，喜欢加注和诈唬，口头禅「跟到底」",
     blurb: "永远在施压，能逼出你的破绽，也常在自己诈唬时翻车。",
   },
@@ -107,7 +112,7 @@ export const AGENTS: AgentDef[] = [
     tagline: "快攻猛打",
     aggression: 0.8,
     tightness: 0.5,
-    model: "deepseek-chat",
+    model: "deepseek-flash",
     persona: "节奏极快的进攻型选手，喜欢快速施压",
     blurb: "出手又快又狠，给你思考的时间很少。",
   },
@@ -148,7 +153,7 @@ const OVERRIDES_KEY = "puke.agentOverrides.v1";
 const defaultSettings: LlmSettings = {
   enabled: false,
   baseUrl: "https://api.deepseek.com/v1",
-  model: "deepseek-chat",
+  model: "deepseek-flash",
   apiKey: "",
   persona: "",
   temperature: 0.6,
@@ -205,7 +210,7 @@ function loadOverrides(): Record<string, AgentModelOverride> {
 export interface Stats {
   ddz: { win: number; lose: number };
   holdem: { win: number; lose: number };
-  hands: { mode: string; result: string; time: number }[];
+  hands: { mode: string; result: string; time: number; logId?: string }[];
 }
 
 function loadStats(): Stats {
@@ -227,8 +232,10 @@ export const store = reactive({
   agentOverrides: loadOverrides(), // 内置/自定义 agent 的模型配置覆盖（model/baseUrl/apiKey）
   startAgents: null as string[] | null, // 从广场开局时指定的对手列表
   pendingNewGame: null as GameMode | null, // 标记进入视图后需开新局
+  pendingStatLogId: null as string | null, // 结算后「查看本局明细」：跳到战绩页自动打开这一局
   activeGame: null as GameMode | null, // 当前进行中的牌局（用于悬浮圆球）
   stats: loadStats(),
+  matchLogs: loadMatchLogs(), // 每局详细过程（抢地主 / 出牌 / 摊牌），供战绩页复盘
   lastResult: null as null | { mode: string; win: boolean; text: string },
 });
 
@@ -291,7 +298,7 @@ export function clearAgentOverride(id: string) {
 
 /** 直接修改自定义 agent 的模型配置（写回 customAgents 并持久化） */
 export function updateCustomAgent(id: string, patch: AgentModelOverride) {
-  const a = store.customAgents.find((c) => c.id === id);
+  const a = store.customAgents.find(c => c.id === id);
   if (!a) return;
   if (patch.baseUrl !== undefined) a.baseUrl = patch.baseUrl.trim() || undefined;
   if (patch.apiKey !== undefined) a.apiKey = patch.apiKey.trim() || undefined;
@@ -302,7 +309,7 @@ export function updateCustomAgent(id: string, patch: AgentModelOverride) {
 // ===================== Agent 查询 =====================
 export function allAgents(): AgentDef[] {
   // 合并模型配置覆盖，使内置 agent 也能用用户指定的 baseUrl/apiKey/model
-  const merged = [...AGENTS, ...store.customAgents].map((a) => {
+  const merged = [...AGENTS, ...store.customAgents].map(a => {
     const o = store.agentOverrides[a.id];
     return o ? { ...a, ...o } : a;
   });
@@ -310,7 +317,7 @@ export function allAgents(): AgentDef[] {
 }
 
 export function agentById(id: string): AgentDef | undefined {
-  return allAgents().find((a) => a.id === id);
+  return allAgents().find(a => a.id === id);
 }
 
 export function isDefault(id: string): boolean {
@@ -347,10 +354,10 @@ function shuffleStr(arr: string[]): string[] {
  */
 export function pickAgents(count: number, exclude: string[] = []): string[] {
   const pool = allAgents()
-    .map((a) => a.id)
-    .filter((id) => !exclude.includes(id));
-  const defs = store.defaultAgentIds.filter((id) => pool.includes(id));
-  const rest = shuffleStr(pool.filter((id) => !defs.includes(id)));
+    .map(a => a.id)
+    .filter(id => !exclude.includes(id));
+  const defs = store.defaultAgentIds.filter(id => pool.includes(id));
+  const rest = shuffleStr(pool.filter(id => !defs.includes(id)));
   return [...defs, ...rest].slice(0, count);
 }
 
@@ -362,11 +369,35 @@ export function beginGame(mode: GameMode, agents?: string[]) {
   store.view = mode;
 }
 
-export function recordResult(mode: "ddz" | "holdem", win: boolean, text: string) {
+export function recordResult(
+  mode: "ddz" | "holdem",
+  win: boolean,
+  text: string,
+  logId?: string,
+) {
   if (win) store.stats[mode].win++;
   else store.stats[mode].lose++;
-  store.stats.hands.unshift({ mode, result: win ? "胜" : "负", time: Date.now() });
+  store.stats.hands.unshift({ mode, result: win ? "胜" : "负", time: Date.now(), logId });
   if (store.stats.hands.length > 50) store.stats.hands.pop();
   store.lastResult = { mode, win, text };
   saveStats();
+}
+
+// ===================== 对局日志（明细复盘） =====================
+
+/** 追加一局明细（最新的在最前），并做条数/体积保护 */
+export function addMatchLog(log: MatchLog) {
+  store.matchLogs.unshift(log);
+  if (store.matchLogs.length > 30) store.matchLogs.splice(30);
+  saveMatchLogs(store.matchLogs);
+}
+
+export function matchLogById(id: string | undefined | null): MatchLog | null {
+  if (!id) return null;
+  return store.matchLogs.find((l) => l.id === id) ?? null;
+}
+
+export function clearMatchLogs() {
+  store.matchLogs.splice(0);
+  saveMatchLogs([]);
 }

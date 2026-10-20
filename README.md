@@ -65,7 +65,7 @@ scripts/            # 引擎自测脚本
 
 - `baseUrl`：OpenAI 兼容接口地址（如 `https://api.deepseek.com/v1`）
 - `apiKey`：你的 API Key
-- `model`：模型名（如 `deepseek-chat`）
+- `model`：模型名（如 `deepseek-flash`）
 - 头像 / 名称 / 性格设定（persona）
 
 保存后即可在对局中选择该 Agent 作为对手。每个 Agent 可使用独立的大模型配置，互不干扰。

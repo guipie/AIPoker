@@ -46,6 +46,10 @@ export interface DdzState {
   message: string;
   // 最近若干次动作（按时间顺序，含“不出”），供 UI 与大模型了解场上形势
   recentActions: DdzAction[];
+  // 本局已经打出的所有牌（累计，按打出顺序），供大模型「记牌」
+  playedCards: Card[];
+  // 累计动作数（play+pass，不受 recentActions 截断影响）；用于判断某个动作是否真的生效
+  actionCount: number;
   // 叫地主轮次内部状态
   biddingOrder: number[];
   bidPtr: number;
@@ -413,6 +417,7 @@ export class DoudizhuGame {
   private redealCount = 0;
   private message = "";
   private actions: DdzAction[] = [];
+  private played: Card[] = [];
 
   constructor(names: string[], humanName = "你", noJokers = false) {
     // names 为机器人名字列表；人类固定为 0 号并置于最前，
@@ -438,15 +443,16 @@ export class DoudizhuGame {
 
   private deal() {
     const deck = shuffle(makeDdzDeck(!this.noJokers));
-    // 3 人局：每人 17 张，余 3 张作底牌；4 人局（无王）：每人 13 张，无底牌
-    const handSize = this.noJokers ? 13 : 17;
+    // 3 人局：54 张，每人 17 张，余 3 张作底牌；
+    // 4 人局（无王）：52 张，每人 12 张，余 4 张作底牌（地主拿到后 16 张）
+    const handSize = this.noJokers ? 12 : 17;
     for (const p of this.players) {
       p.hand = sortDdzCards(deck.splice(0, handSize));
       p.handCount = p.hand.length;
       p.lastPlay = null;
       p.role = null;
     }
-    this.landlordCards = deck; // 剩余作底牌（4 人局为 0 张）
+    this.landlordCards = deck; // 剩余作底牌（3 人局 3 张 / 4 人局 4 张）
     this.phase = "bidding";
     this.currentBid = 0;
     this.bidHistory = [];
@@ -455,6 +461,7 @@ export class DoudizhuGame {
     this.passCount = 0;
     this.winner = null;
     this.actions = [];
+    this.played = [];
     // 随机先叫，按人数生成叫分顺序
     const first = Math.floor(Math.random() * this.players.length);
     const n = this.players.length;
@@ -526,6 +533,7 @@ export class DoudizhuGame {
     }
     // 执行出牌
     this.actions.push({ playerId, type: "play", cards });
+    this.played.push(...cards);
     const idSet = new Set(cardIds);
     player.hand = player.hand.filter((c) => !idSet.has(c.id));
     player.handCount = player.hand.length;
@@ -596,6 +604,8 @@ export class DoudizhuGame {
       bidPtr: this.bidPtr,
       redealCount: this.redealCount,
       recentActions: this.actions.slice(-8).map((a) => ({ ...a, cards: a.cards ? [...a.cards] : null })),
+      playedCards: [...this.played],
+      actionCount: this.actions.length,
     };
   }
 }

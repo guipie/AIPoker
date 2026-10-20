@@ -19,7 +19,9 @@
       "active": true,
       "category": "Game",
       "copyright": "",
-      "deb": { "depends": [] },
+      "deb": {
+        "depends": []
+      },
       "externalBin": [],
       "icon": [
         "icons/32x32.png",
@@ -30,11 +32,21 @@
       ],
       "identifier": "com.puke.app",
       "longDescription": "",
-      "macOS": { "entitlements": null, "exceptionDomain": "", "frameworks": [], "providerShortName": null, "signingIdentity": null },
+      "macOS": {
+        "entitlements": null,
+        "exceptionDomain": "",
+        "frameworks": [],
+        "providerShortName": null,
+        "signingIdentity": null
+      },
       "resources": [],
       "shortDescription": "",
       "targets": "all",
-      "windows": { "certificateThumbprint": null, "digestAlgorithm": "sha256", "timestampUrl": "" }
+      "windows": {
+        "certificateThumbprint": null,
+        "digestAlgorithm": "sha256",
+        "timestampUrl": ""
+      }
     },
     "security": {
       "csp": null
@@ -42,10 +54,11 @@
     "windows": [
       {
         "fullscreen": false,
-        "height": 800,
         "resizable": true,
         "title": "我和大模型玩扑克",
-        "width": 1200
+        "width": 1200,
+        "minWidth": 960,
+        "minHeight": 800
       }
     ]
   }

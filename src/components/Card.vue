@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { Card as CardType } from "../engine/cards";
-import { isRed, SUIT_SYMBOL, rankLabel } from "../engine/cards";
+import { isRed, rankLabel, SUIT_SYMBOL } from "../engine/cards";
 
 const props = defineProps<{
   card: CardType;
   selected?: boolean;
   faceDown?: boolean;
   small?: boolean;
-  size?: "sm" | "md" | "lg";
+  size?: "sm" | "md" | "lg" | "xlg";
   disabled?: boolean;
   flippable?: boolean; // 是否在 faceDown 切换时播放翻牌动画
 }>();
@@ -19,6 +19,7 @@ const sizeClass = computed(() => {
   if (props.small) return "w-11 h-[4.6rem] text-[11px]";
   if (props.size === "sm") return "w-12 h-[5.1rem] text-xs";
   if (props.size === "lg") return "w-[4.6rem] h-[6.6rem] text-base";
+  if (props.size === "xlg") return "w-[5.2rem] h-[7.4rem] text-lg";
   return "w-16 h-[5.9rem] text-sm";
 });
 
@@ -52,7 +53,11 @@ const centerGlyph = computed(() => {
     <!-- 3D 翻牌容器 -->
     <div
       class="card-flip absolute inset-0"
-      :style="faceDown ? 'transform: rotateY(180deg); transform-style: preserve-3d' : 'transform-style: preserve-3d'"
+      :style="
+        faceDown
+          ? 'transform: rotateY(180deg); transform-style: preserve-3d'
+          : 'transform-style: preserve-3d'
+      "
     >
       <!-- 牌面 -->
       <div
@@ -61,7 +66,15 @@ const centerGlyph = computed(() => {
       >
         <div
           class="absolute left-1 top-0.5 flex flex-col items-center leading-none"
-          :class="isJoker ? (isBig ? 'text-red-600' : 'text-slate-800') : red ? 'text-red-600' : 'text-slate-900'"
+          :class="
+            isJoker
+              ? isBig
+                ? 'text-red-600'
+                : 'text-slate-800'
+              : red
+              ? 'text-red-600'
+              : 'text-slate-900'
+          "
         >
           <span class="font-extrabold">{{ isJoker ? (isBig ? "大" : "小") : label }}</span>
           <span v-if="!isJoker">{{ symbol }}</span>
@@ -71,21 +84,34 @@ const centerGlyph = computed(() => {
           <span
             v-if="isJoker"
             class="font-black tracking-tighter"
-            :class="[isBig ? 'text-red-600' : 'text-slate-800', small ? 'text-[10px]' : 'text-base']"
+            :class="[
+              isBig ? 'text-red-600' : 'text-slate-800',
+              small ? 'text-[10px]' : 'text-base',
+            ]"
             style="-webkit-text-stroke: 0.4px currentColor"
-            >{{ centerGlyph }}</span
           >
+            {{ centerGlyph }}
+          </span>
           <span
             v-else
             class="drop-shadow-sm"
             :class="[red ? 'text-red-600' : 'text-slate-900', small ? 'text-xl' : 'text-[2rem]']"
-            >{{ centerGlyph }}</span
           >
+            {{ centerGlyph }}
+          </span>
         </div>
 
         <div
           class="absolute bottom-0.5 right-1 flex rotate-180 flex-col items-center leading-none"
-          :class="isJoker ? (isBig ? 'text-red-600' : 'text-slate-800') : red ? 'text-red-600' : 'text-slate-900'"
+          :class="
+            isJoker
+              ? isBig
+                ? 'text-red-600'
+                : 'text-slate-800'
+              : red
+              ? 'text-red-600'
+              : 'text-slate-900'
+          "
         >
           <span class="font-extrabold">{{ isJoker ? (isBig ? "大" : "小") : label }}</span>
           <span v-if="!isJoker">{{ symbol }}</span>

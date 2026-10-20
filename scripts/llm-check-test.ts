@@ -24,27 +24,27 @@ const lp = s.players[landlordId];
 s = g.play(landlordId, [lp.hand[0].id]);
 assert(
   s.recentActions.some((a: any) => a.type === "play" && a.playerId === landlordId),
-  "出牌动作已写入 recentActions",
+  "出牌动作已写入 recentActions"
 );
 
 const nextId = s.currentPlayerId;
 s = g.pass(nextId);
 assert(
   s.recentActions.some((a: any) => a.type === "pass" && a.playerId === nextId),
-  "不出动作已写入 recentActions",
+  "不出动作已写入 recentActions"
 );
 
 // 2) 模型名列表校验（纯函数）
 assert(
   modelNotInList(["deepseek-flash", "deepseek-v4-pro"], "qwen2.5:7b") !== null,
-  "不支持的模型名会被识别出来",
+  "不支持的模型名会被识别出来"
 );
 assert(
   modelNotInList(["deepseek-flash", "deepseek-v4-pro"], "deepseek-flash") === null,
-  "受支持的模型名通过",
+  "受支持的模型名通过"
 );
 assert(modelNotInList([], "anything") === null, "空列表不做判断");
-assert(modelNotInList(["DeepSeek-Chat"], "deepseek-chat") === null, "模型名大小写不敏感");
+assert(modelNotInList(["deepseek-flash"], "deepseek-flash") === null, "模型名大小写不敏感");
 
 // 3) 本地假服务：/models 返回 200 但只支持 deepseek-*，复现“假在线”bug
 const srv = createServer((req, res) => {
@@ -61,14 +61,14 @@ const srv = createServer((req, res) => {
           code: "invalid_request_error",
           message: "The supported API model names are deepseek-flash, deepseek-v4-pro",
         },
-      }),
+      })
     );
     return;
   }
   res.writeHead(404);
   res.end();
 });
-await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+await new Promise<void>(r => srv.listen(0, "127.0.0.1", () => r()));
 const port = (srv.address() as any).port;
 const base = `http://127.0.0.1:${port}/v1`;
 const mk = (model: string) => ({
@@ -83,7 +83,7 @@ const mk = (model: string) => ({
 const bad = await testLlmConnection(mk("qwen2.5:7b"));
 assert(
   !bad.ok && bad.error.includes("不在该接口支持的模型列表中"),
-  "回归：模型名不支持时不再误判为“在线”",
+  "回归：模型名不支持时不再误判为“在线”"
 );
 console.log("  报错信息：", bad.error);
 

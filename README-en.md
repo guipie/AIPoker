@@ -65,7 +65,7 @@ Open **Agent Plaza** → click **Add**, then fill in:
 
 - `baseUrl`: an OpenAI-compatible endpoint (e.g. `https://api.deepseek.com/v1`)
 - `apiKey`: your API key
-- `model`: model name (e.g. `deepseek-chat`)
+- `model`: model name (e.g. `deepseek-flash`)
 - avatar / name / persona
 
 Save it, then pick the agent as your opponent in any game. Each agent can use its own LLM config independently.

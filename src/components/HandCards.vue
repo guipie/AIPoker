@@ -68,6 +68,7 @@ function cardStyle(i: number) {
         :selected="selectedIds.has(card.id)"
         :disabled="disabled"
         @toggle="emit('toggle', card.id)"
+        size="lg"
       />
     </div>
   </div>

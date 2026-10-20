@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onActivated, onDeactivated, onMounted, ref, watch } from "vue";
 import { sfx } from "../audio/sfx";
+import AgentModelEditor from "../components/AgentModelEditor.vue";
 import CardComp from "../components/Card.vue";
 import DoudizhuSeat from "../components/DoudizhuSeat.vue";
-import AgentModelEditor from "../components/AgentModelEditor.vue";
 import HandCards from "../components/HandCards.vue";
 import { SUIT_SYMBOL, rankLabel, type Card } from "../engine/cards";
 import {
@@ -14,9 +14,10 @@ import {
   suggestBid,
   suggestLead,
 } from "../engine/doudizhu";
-import { llmDdzDecision, type LlmConfig } from "../engine/llm";
-import { agentById, pickAgents, recordResult, store } from "../store";
-import { checkAgents, configForAgent, type AgentConnResult } from "../utils/llmCheck";
+import { llmDdzBid, llmDdzDecision, type LlmConfig } from "../engine/llm";
+import { agentById, addMatchLog, pickAgents, recordResult, store } from "../store";
+import { checkAgents, configForAgent, shouldUseLlm, type AgentConnResult } from "../utils/llmCheck";
+import { newLogId, type MatchLogEntry } from "../utils/matchLog";
 
 const game = ref<DoudizhuGame | null>(null);
 const state = ref<any>(null);
@@ -84,29 +85,18 @@ function relationOf(pid: number, myId: number, n: number): string {
   return "";
 }
 
-/** 组装给大模型的完整牌局上下文：地主 / 队友 / 各家剩牌 / 上家最近出牌结果 */
+/** 组装给大模型的完整牌局上下文（配合 prompts.ts 的 doudizuRules） */
 function buildDdzInput(s: any, player: any) {
   const n = s.players.length;
   const landlord = s.players.find((p: any) => p.role === "landlord") ?? null;
-  const myRole = player.role;
-  const teammates =
-    myRole === "farmer"
-      ? s.players
-          .filter((p: any) => p.role === "farmer" && p.id !== player.id)
-          .map((p: any) => p.name)
-      : [];
-  const opponents =
-    myRole === "landlord"
-      ? s.players.filter((p: any) => p.id !== player.id).map((p: any) => p.name)
-      : landlord
-      ? [landlord.name]
-      : [];
+  const farmerIds = s.players.filter((p: any) => p.role === "farmer").map((p: any) => p.name);
 
   const seats = s.players.map((p: any) => ({
     name: p.id === player.id ? `${p.name}（我）` : p.name,
     role: roleText(p.role),
     handCount: p.handCount,
     relation: relationOf(p.id, player.id, n),
+    isMe: p.id === player.id,
   }));
 
   const recentActions = (s.recentActions ?? []).map((a: any) => {
@@ -117,21 +107,165 @@ function buildDdzInput(s: any, player: any) {
   });
 
   return {
+    num: n as 3 | 4,
+    myId: player.name,
+    landlordId: landlord ? landlord.name : "（尚未确定）",
+    farmerIds,
     hand: player.hand.map(ddzLabel),
     lastPlay: s.lastPlay ? s.lastPlay.map(ddzLabel) : null,
-    lastPlayerName: s.lastPlayerId != null ? s.players[s.lastPlayerId]?.name ?? null : null,
-    freeLead: !s.lastPlay,
-    myRole: roleText(myRole),
-    landlordName: landlord ? landlord.name : "（尚未确定）",
-    teammates,
-    opponents,
+    playedCards: (s.playedCards ?? []).map(ddzLabel),
     seats,
     recentActions,
     persona: agentFor(player.id)?.persona,
   };
 }
 
+/** 前面玩家的抢地主记录（喂给 qiangDoudizuRules 的 prePersons） */
+function buildPrePersons(s: any) {
+  return (s.bidHistory ?? []).map((b: any) => ({
+    id: s.players[b.playerId]?.name ?? `玩家${b.playerId}`,
+    action: (b.score > 0 ? "snatch" : "pass") as "snatch" | "pass",
+    ...(b.score > 0 ? { snatchScore: b.score } : {}),
+  }));
+}
+
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// ===== 对局明细记录（抢地主 + 每一手出牌，结束后入库） =====
+const matchEntries = ref<MatchLogEntry[]>([]);
+const initialHands = ref<{ pid: number; name: string; role: string; hand: string[] }[]>([]);
+const bottomSnapshot = ref<string[]>([]);
+const lastLogId = ref<string | null>(null);
+let logClosed = false;
+
+function pushLog(e: MatchLogEntry) {
+  matchEntries.value.push(e);
+}
+
+/** 出牌（统一入口）：真的生效了才写日志 */
+function doPlay(
+  pid: number,
+  ids: string[],
+  meta: { source: "llm" | "rule" | "human"; reason?: string }
+) {
+  const g = game.value!;
+  const hand = state.value.players[pid].hand as Card[];
+  const labels = ids.map(id => {
+    const c = hand.find(x => x.id === id);
+    return c ? ddzLabel(c) : id;
+  });
+  const before = state.value.actionCount ?? 0;
+  const next = g.play(pid, ids);
+  applyState(next);
+  if ((next.actionCount ?? 0) > before) {
+    pushLog({
+      kind: "play",
+      playerId: pid,
+      playerName: next.players[pid].name,
+      cards: labels,
+      handLeft: next.players[pid].handCount,
+      source: meta.source,
+      reason: meta.reason,
+    });
+    return true;
+  }
+  return false;
+}
+
+/** 不出（统一入口）：真的生效了才写日志 */
+function doPass(pid: number, meta: { source: "llm" | "rule" | "human"; reason?: string }) {
+  const g = game.value!;
+  const before = state.value.actionCount ?? 0;
+  const next = g.pass(pid);
+  applyState(next);
+  if ((next.actionCount ?? 0) > before) {
+    pushLog({
+      kind: "pass",
+      playerId: pid,
+      playerName: next.players[pid].name,
+      handLeft: next.players[pid].handCount,
+      source: meta.source,
+      reason: meta.reason,
+    });
+    return true;
+  }
+  return false;
+}
+
+/** 抢地主（统一入口） */
+function doBid(
+  pid: number,
+  score: number,
+  meta: { source: "llm" | "rule" | "human"; reason?: string }
+) {
+  const curBid = state.value.currentBid ?? 0;
+  // 引擎会把“叫分不高于当前最高分”当作不叫，这里同步算出生效值用于记录
+  const eff = score !== 0 && score <= curBid ? 0 : score;
+  const next = game.value!.bid(pid, score);
+  applyState(next);
+  pushLog({
+    kind: "bid",
+    playerId: pid,
+    playerName: (next.players[pid] ?? state.value.players[pid]).name,
+    score: eff,
+    source: meta.source,
+    reason: meta.reason,
+  });
+}
+
+/** 一局结束：把明细入库，并在战绩里挂上 logId */
+function finalizeMatch(win: boolean) {
+  if (logClosed) return;
+  logClosed = true;
+  const s = state.value;
+  if (!s) return;
+  const landlord = s.players.find((p: any) => p.role === "landlord");
+  const id = newLogId("ddz");
+  const text = win ? "你赢了这局斗地主！" : "这局斗地主你输了";
+  type SeatSnap = { pid: number; name: string; role: string; hand: string[] };
+  const seats: SeatSnap[] = initialHands.value.length
+    ? initialHands.value
+    : s.players.map((p: any) => ({
+        pid: p.id,
+        name: p.name,
+        role: roleText(p.role),
+        hand: p.hand.map(ddzLabel),
+      }));
+  addMatchLog({
+    id,
+    mode: "ddz",
+    time: Date.now(),
+    result: win ? "胜" : "负",
+    summary: text,
+    players: s.players.map((p: any) => p.name),
+    detail: {
+      kind: "ddz",
+      players: seats.map((h: SeatSnap) => ({
+        name: h.pid === 0 ? "你" : h.name,
+        role: h.role,
+        agent: h.pid === 0 ? "（你本人）" : (agentById(agentMap.value[h.pid] ?? "")?.name ?? ""),
+        hand: h.hand,
+      })),
+      landlordName: landlord?.name ?? "",
+      bottomCards: bottomSnapshot.value,
+      myRole: roleText(me.value?.role),
+      winner: s.winner === "landlord" ? "地主" : "农民",
+      redealCount: s.redealCount ?? 0,
+    },
+    entries: [...matchEntries.value],
+  });
+  lastLogId.value = id;
+  recordResult("ddz", win, text, id);
+}
+
+/** 结算弹层：跳到战绩页并直接打开本局复盘 */
+function viewMatchDetail() {
+  if (!lastLogId.value) return;
+  sfx.click();
+  paused = true;
+  store.pendingStatLogId = lastLogId.value;
+  store.view = "stats";
+}
 
 function newGame(ids?: string[]) {
   const list = ids && ids.length ? ids.slice(0, 3) : pickAgents(2);
@@ -140,6 +274,12 @@ function newGame(ids?: string[]) {
   const noJokers = list.length >= 3; // 4 人局（3 机器人 + 你）去掉大小王
   game.value = new DoudizhuGame(names, "你", noJokers);
   state.value = game.value.getState();
+  // 重置本局明细
+  matchEntries.value = [];
+  initialHands.value = [];
+  bottomSnapshot.value = [];
+  lastLogId.value = null;
+  logClosed = false;
   selectedIds.value.clear();
   thinkingId.value = null;
   paused = false;
@@ -175,13 +315,13 @@ async function requestNewGame(ids?: string[]) {
 // 关闭大模型后，立刻清掉残留的“连接失败/去设置”提示（keep-alive 会保留下次仍是旧状态）
 watch(
   () => store.settings.enabled,
-  (on) => {
+  on => {
     if (!on) {
       connErrors.value = [];
       connChecking.value = false;
       agentOnline.value = {};
     }
-  },
+  }
 );
 
 // 加减机器人（重置发牌）
@@ -230,30 +370,65 @@ async function driveBots() {
 
       const player = s.players[s.currentPlayerId];
       if (s.phase === "bidding") {
-        const score = suggestBid(player.hand);
+        // 抢地主：启用大模型时让 LLM 决策（qiangDoudizuRules），失败/未启用才用规则评分
+        let score = suggestBid(player.hand);
+        let reason = "";
+        let source: "llm" | "rule" = "rule";
+        const aid = agentMap.value[player.id];
+        if (shouldUseLlm(agentFor(player.id))) {
+          let llmErr: string | null = null;
+          const out = await llmDdzBid(
+            llmConfigFor(player.id),
+            {
+              num: s.players.length as 3 | 4,
+              myHand: player.hand.map(ddzLabel),
+              prePersons: buildPrePersons(s),
+              persona: agentFor(player.id)?.persona,
+            },
+            msg => {
+              llmErr = msg;
+              if (aid) markOffline(aid, msg);
+            }
+          );
+          if (aid && !llmErr) markOnline(aid);
+          if (out) {
+            source = "llm";
+            reason = out.reason ?? "";
+            if (out.action === "snatch") {
+              let sc = out.snatchScore ?? 1;
+              // 想抢就必须抢得比当前最高分更高，否则引擎会当作不抢
+              if (sc <= s.currentBid) sc = s.currentBid + 1;
+              score = sc >= 1 && sc <= 3 ? sc : 0;
+            } else {
+              score = 0;
+            }
+          }
+        }
         sfx.chip();
-        applyState(game.value!.bid(player.id, score));
+        doBid(player.id, score, { source, reason });
       } else {
         // LLM 决策：严格区分「LLM 明确选择不出」与「LLM 调用失败」，
         // 否则 LLM 说“不压队友的牌”会被规则 AI 兜底强行出牌（bug：页面打出 6）
         let ids: string[] | null = null;
         let llmPass = false; // LLM 明确决定不出
         let llmUsed = false; // LLM 正常返回了决策（含“不出”）
-        if (store.settings.enabled && (store.settings.apiKey || agentFor(player.id)?.apiKey)) {
+        let reason = ""; // LLM 给出的决策理由（写入明细）
+        if (shouldUseLlm(agentFor(player.id))) {
           const aid = agentMap.value[player.id];
           let llmErr: string | null = null;
           try {
             const out = await llmDdzDecision(
               llmConfigFor(player.id),
               buildDdzInput(s, player),
-              (msg) => {
+              msg => {
                 llmErr = msg;
                 if (aid) markOffline(aid, msg);
-              },
+              }
             );
             if (aid && !llmErr) markOnline(aid);
             if (out) {
               llmUsed = true;
+              reason = out.reason ?? "";
               if (out.play && out.play.length) {
                 const map = new Map(player.hand.map((c: Card) => [ddzLabel(c), c.id]));
                 ids = out.play.map((l: string) => map.get(l)).filter(Boolean) as string[];
@@ -261,6 +436,7 @@ async function driveBots() {
                   // 给出的牌在手牌里一张都对不上 → 视为调用失败，走规则兜底
                   llmUsed = false;
                   llmPass = false;
+                  reason = "";
                 }
               } else {
                 llmPass = true; // play 为 null/空 → 明确不出
@@ -275,53 +451,51 @@ async function driveBots() {
           const cards = ids.map(id => player.hand.find((c: Card) => c.id === id)!).filter(Boolean);
           const pat = detectPattern(cards);
           const lastPat = s.lastPlay ? detectPattern(s.lastPlay) : null;
+          const src = llmUsed ? "llm" : "rule";
           if (pat && (!lastPat || canBeat(pat, lastPat))) {
             sfx.play();
-            applyState(game.value!.play(player.id, ids));
+            doPlay(player.id, ids, { source: src, reason });
           } else if (lastPat) {
             // 出的牌压不过/非法 → 不出（合法动作）
             sfx.fold();
-            applyState(game.value!.pass(player.id));
+            doPass(player.id, { source: src, reason: reason || "给我的牌压不过上家" });
           } else {
             // 自由领出但牌型非法 → 回退规则 AI 领出
             const lead = suggestLead(player.hand);
             sfx.play();
-            applyState(
-              game.value!.play(
-                player.id,
-                lead.map(c => c.id)
-              )
+            doPlay(
+              player.id,
+              lead.map(c => c.id),
+              { source: "rule", reason: "领出兜底" }
             );
           }
         } else if (llmPass && s.lastPlay) {
           // 尊重 LLM 的「不出」决策（如不压队友的牌、保存实力）——不能被兜底覆盖
           sfx.fold();
-          applyState(game.value!.pass(player.id));
+          doPass(player.id, { source: "llm", reason });
         } else {
           // LLM 失败 / 未启用 / 自由领出不能不出 → 规则 AI
           const last = s.lastPlay ? detectPattern(s.lastPlay) : null;
           if (!last) {
             const lead = suggestLead(player.hand);
             sfx.play();
-            applyState(
-              game.value!.play(
-                player.id,
-                lead.map(c => c.id)
-              )
+            doPlay(
+              player.id,
+              lead.map(c => c.id),
+              { source: "rule", reason: "规则 AI 领出" }
             );
           } else {
             const beats = findBeats(player.hand, last);
             if (beats) {
               sfx.play();
-              applyState(
-                game.value!.play(
-                  player.id,
-                  beats.map(c => c.id)
-                )
+              doPlay(
+                player.id,
+                beats.map(c => c.id),
+                { source: "rule", reason: "规则 AI 压牌" }
               );
             } else {
               sfx.fold();
-              applyState(game.value!.pass(player.id));
+              doPass(player.id, { source: "rule", reason: "规则 AI 无牌可压" });
             }
           }
         }
@@ -334,7 +508,7 @@ async function driveBots() {
 
   if (state.value?.phase === "gameover") {
     const win = iWin.value;
-    recordResult("ddz", win, win ? "你赢了这局斗地主！" : "这局斗地主你输了");
+    finalizeMatch(win);
     win ? sfx.win() : sfx.lose();
   }
 }
@@ -348,7 +522,18 @@ function resumeIfNeeded() {
 }
 
 function applyState(next: any) {
+  const prevPhase = state.value?.phase;
   state.value = next;
+  // 抢地主结束、正式开打的那一刻，快照各家手牌（含地主底牌），供复盘查看
+  if (prevPhase === "bidding" && next.phase === "playing") {
+    initialHands.value = next.players.map((p: any) => ({
+      pid: p.id,
+      name: p.name,
+      role: roleText(p.role),
+      hand: p.hand.map(ddzLabel),
+    }));
+    bottomSnapshot.value = (next.landlordCards ?? []).map(ddzLabel);
+  }
 }
 
 function toggleCard(id: string) {
@@ -366,7 +551,7 @@ function playSelected() {
   if (ids.length === 0) return;
   busy.value = true;
   sfx.play();
-  applyState(game.value!.play(0, ids));
+  doPlay(0, ids, { source: "human" });
   selectedIds.value.clear();
   busy.value = false;
   driveBots();
@@ -376,7 +561,7 @@ function pass() {
   if (!isMyTurn.value || busy.value) return;
   busy.value = true;
   sfx.fold();
-  applyState(game.value!.pass(0));
+  doPass(0, { source: "human" });
   selectedIds.value.clear();
   busy.value = false;
   driveBots();
@@ -386,7 +571,7 @@ function bid(score: number) {
   if (!isMyTurn.value || !isBidding.value || busy.value) return;
   busy.value = true;
   sfx.chip();
-  applyState(game.value!.bid(0, score));
+  doBid(0, score, { source: "human" });
   selectedIds.value.clear();
   busy.value = false;
   driveBots();
@@ -419,7 +604,9 @@ function goSettings() {
 }
 
 // ===== 牌桌上各 agent 的大模型在线状态 =====
-const agentOnline = ref<Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }>>({});
+const agentOnline = ref<
+  Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }>
+>({});
 const showEditor = ref(false);
 const editAgentId = ref<string | null>(null);
 
@@ -429,7 +616,8 @@ function connFor(id: number) {
 }
 
 function applyOnline(res: AgentConnResult[]) {
-  const map: Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }> = {};
+  const map: Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }> =
+    {};
   for (const r of res) {
     const a = agentById(r.id);
     map[r.id] = { ok: r.ok, model: a?.model ?? store.settings.model, error: r.error };
@@ -617,7 +805,13 @@ onDeactivated(() => {
 
             <!-- 中央需压过的牌 -->
             <div class="flex min-h-[96px] items-center justify-center">
-              <div v-if="centerCards.length" class="flex animate-card-fly">
+              <div
+                v-if="!centerCards.length || centerCards.length == 0"
+                class="text-sm text-white/40"
+              >
+                桌面空闲
+              </div>
+              <div v-else class="flex animate-card-fly">
                 <div
                   v-for="(c, i) in centerCards"
                   :key="c.id"
@@ -626,7 +820,6 @@ onDeactivated(() => {
                   <CardComp :card="c" />
                 </div>
               </div>
-              <div v-else class="text-sm text-white/40">桌面空闲</div>
             </div>
 
             <!-- 叫地主 -->
@@ -774,6 +967,13 @@ onDeactivated(() => {
           </span>
         </div>
         <button class="btn btn-primary px-8 py-2.5" @click="requestNewGame()">再来一局</button>
+        <button
+          v-if="lastLogId"
+          class="btn btn-ghost mt-3 block w-full px-8 py-2 text-sm"
+          @click="viewMatchDetail"
+        >
+          🔍 查看本局明细（抢地主 / 出牌全过程）
+        </button>
       </div>
       <div v-if="iWin" class="pointer-events-none absolute inset-0 overflow-hidden">
         <span

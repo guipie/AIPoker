@@ -1,6 +1,8 @@
 // LLM 决策客户端：调用 OpenAI 兼容接口（DeepSeek / OpenAI / Ollama 等）
 // 大模型作为「牌桌大脑」给出行动建议；任何失败都回退到规则 AI（由调用方处理）。
 
+import { doudizuRules, qiangDoudizuRules } from "../utils/prompts";
+
 export interface LlmConfig {
   enabled: boolean;
   baseUrl: string;
@@ -252,18 +254,63 @@ ${input.players.map((p) => `- ${p.name} 筹码${p.stack} 已投入${p.committed}
 }
 
 // ===================== 斗地主：让 LLM 决策 =====================
+// 提示词统一由 src/utils/prompts.ts 生成（用户自己打磨的规则版 prompt），
+// 这里只负责：拼人设 / 补充局势 → 调接口 → 解析 JSON。
+
+export interface DdzBidInput {
+  num: 3 | 4; // 玩家人数
+  myHand: string[]; // 我的手牌（如 ["大王","♠2","♥A"]）
+  prePersons: Array<{ id: string; action: "snatch" | "pass"; snatchScore?: number }>; // 前面玩家的抢地主记录
+  persona?: string;
+}
+
+export interface DdzBidOutput {
+  action: "snatch" | "pass";
+  snatchScore: number | null;
+  reason?: string;
+}
+
+/** 抢地主决策（对应 prompts.ts 的 qiangDoudizuRules） */
+export async function llmDdzBid(
+  config: LlmConfig,
+  input: DdzBidInput,
+  onError?: (msg: string) => void,
+): Promise<DdzBidOutput | null> {
+  const system = `你是一名斗地主 AI 玩家${input.persona ? "，人设：" + input.persona : ""}。严格遵守【输出约定】：只输出原始 JSON，不要 markdown、不要解释文字、不要多余换行。`;
+  const user = qiangDoudizuRules(input.num, input.prePersons, input.myHand);
+  try {
+    const text = await callChat(config, [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ]);
+    const out = parseJsonObject<{ action?: string; snatchScore?: number | null; reason?: string }>(
+      text,
+    );
+    if (!out) return null;
+    if (out.action === "pass") return { action: "pass", snatchScore: null, reason: out.reason };
+    if (out.action === "snatch") {
+      const raw = Number(out.snatchScore);
+      // 抢分归一化到 1~3；模型给了奇怪值就用 1 分
+      const score = Number.isFinite(raw) && raw >= 1 ? Math.min(3, Math.round(raw)) : 1;
+      return { action: "snatch", snatchScore: score, reason: out.reason };
+    }
+    return null;
+  } catch (e: any) {
+    onError?.(e?.message ?? String(e));
+    return null;
+  }
+}
 
 export interface DdzLlmInput {
-  hand: string[];
-  lastPlay: string[] | null; // 当前需要压过的牌（自由领出时为 null）
-  lastPlayerName: string | null; // 这手牌是谁打出的
-  freeLead: boolean; // 本轮是否由我领出
-  myRole: string; // "地主" | "农民" | "未定"
-  landlordName: string; // 地主是谁
-  teammates: string[]; // 我的队友（地主时为空）
-  opponents: string[]; // 我的对手
-  seats: { name: string; role: string; handCount: number; relation: string }[]; // 按出牌顺序
-  recentActions: string[]; // 最近各家出牌结果（按时间顺序，含“不出”）
+  num: 3 | 4;
+  myId: string; // 我的名字（prompt 内用于标识身份）
+  landlordId: string; // 地主名字
+  farmerIds: string[]; // 农民名字列表（含我自己，如果我是农民）
+  hand: string[]; // 我的手牌
+  lastPlay: string[] | null; // 需要压过的牌（首出为 null）
+  playedCards: string[]; // 全局已经打出的所有牌（记牌）
+  seats?: { name: string; role: string; handCount: number; relation?: string; isMe?: boolean }[];
+  recentActions?: string[]; // 最近各家出牌结果（按时间顺序）
   persona?: string;
 }
 
@@ -272,57 +319,44 @@ export interface DdzLlmOutput {
   reason?: string;
 }
 
+/** 出牌决策（对应 prompts.ts 的 doudizuRules） */
 export async function llmDdzDecision(
   config: LlmConfig,
   input: DdzLlmInput,
   onError?: (msg: string) => void,
 ): Promise<DdzLlmOutput | null> {
-  // 身份策略提示：农民要配合队友，地主是独战
-  let roleHint = "";
-  if (input.myRole === "农民" && input.teammates.length) {
-    roleHint = `你是农民，队友是：${input.teammates.join("、")}。要和队友配合打地主：地主出的牌尽量压住；队友出的牌一般不要压（除非你能一把走完，或需要给队友让路）。`;
-  } else if (input.myRole === "地主") {
-    roleHint = `你是地主，独战所有农民（${input.opponents.join("、")}），他们会联合针对你。控制节奏，用小牌消耗、留大牌和炸弹控场。`;
+  // 局势补充信息放在 system 里，保证 user 段落是 prompts.ts 原样输出
+  const extra: string[] = [];
+  if (input.seats && input.seats.length) {
+    extra.push(
+      "【各家剩余手牌】（按出牌顺序）\n" +
+        input.seats
+          .map(
+            (p) =>
+              `- ${p.name}（${p.role}${p.relation ? "，" + p.relation : ""}）剩 ${p.handCount} 张${
+                p.handCount <= 2 ? " ⚠️快走完了，优先封堵" : ""
+              }`,
+          )
+          .join("\n"),
+    );
+  }
+  if (input.recentActions && input.recentActions.length) {
+    extra.push("【最近出牌记录】（最新在最后）\n" + input.recentActions.map((a) => `- ${a}`).join("\n"));
   }
 
-  const system = `你是一名斗地主 AI 玩家${
-    input.persona ? "，人设：" + input.persona : ""
-  }。请只输出 JSON：{"play":[出牌文本数组，如["♠3","♥3"]；或 null 表示不出],"reason":"简短中文理由"}。
-规则要点：
-- 必须出合法牌型：单张/对子/三张/三带一/三带二/顺子(5张起)/连对/飞机/四带二/炸弹/王炸。
-- 只能出自己手牌里有的牌，不要凭空捏造。
-- 若不是自由领出，出的牌必须能压过桌面上那手牌（同牌型更大，或用炸弹/王炸）；压不过就输出 null（不出）。
-- 结合各家剩余牌数判断：有人只剩 1-2 张时要优先封堵。
-${roleHint}`;
+  const system = `你是一名斗地主 AI 玩家${input.persona ? "，人设：" + input.persona : ""}。严格遵守【输出约定】：只输出原始 JSON，不要 markdown、不要解释文字、不要多余换行。${
+    extra.length ? "\n\n" + extra.join("\n\n") : ""
+  }`;
 
-  const user = `【牌桌信息】
-- 地主：${input.landlordName}
-- 我的身份：${input.myRole}
-${input.teammates.length ? `- 我的队友：${input.teammates.join("、")}` : ""}
-${input.opponents.length ? `- 我的对手：${input.opponents.join("、")}` : ""}
-
-【各家情况】（按出牌顺序）
-${input.seats
-  .map(
-    (p) =>
-      `- ${p.name}（${p.role}${p.relation ? "，" + p.relation : ""}）剩 ${p.handCount} 张${
-        p.handCount <= 2 ? " ⚠️快走完了" : ""
-      }`,
-  )
-  .join("\n")}
-
-【最近出牌结果】（按时间顺序，最新在最后）
-${input.recentActions.length ? input.recentActions.map((a) => `- ${a}`).join("\n") : "- 本局还没有人出牌"}
-
-【当前需要你处理的一手】
-${
-  input.freeLead
-    ? "你是本轮首家，可以自由出任意合法牌型（不能不出）。"
-    : `需要压过的牌：${(input.lastPlay ?? []).join(" ")}（由 ${input.lastPlayerName ?? "上家"} 打出）\n压不过就输出 null（不出）。`
-}
-
-【我的手牌】（${input.hand.length} 张）：${input.hand.join(" ")}
-请决策。`;
+  const user = doudizuRules(
+    input.num,
+    input.landlordId,
+    input.myId,
+    input.farmerIds,
+    input.hand,
+    input.lastPlay,
+    input.playedCards,
+  );
 
   try {
     const text = await callChat(config, [
