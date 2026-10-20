@@ -31,7 +31,7 @@ const isBig = computed(() => props.card.rank === 17);
 
 // 数字牌（2~10）的居中点数排布提示：用点数决定画几颗（简化处理，展示花色符号）
 const centerGlyph = computed(() => {
-  if (isJoker.value) return isBig.value ? "JOKER" : "joker";
+  if (isJoker.value) return "王"; // 窄牌上 "JOKER" 会折行，单个「王」更清晰（大小由角标区分）
   const r = props.card.rank;
   if (r >= 11 && r <= 14) return label.value; // J Q K A
   return symbol.value;

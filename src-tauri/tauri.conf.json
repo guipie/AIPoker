@@ -57,8 +57,10 @@
         "resizable": true,
         "title": "我和大模型玩扑克",
         "width": 1200,
+        "height": 880,
         "minWidth": 960,
-        "minHeight": 800
+        "minHeight": 760,
+        "center": true
       }
     ]
   }

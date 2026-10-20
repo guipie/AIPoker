@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { Card } from "../engine/cards";
+import { ddzValue, type Card } from "../engine/cards";
 import CardComp from "./Card.vue";
 
 const props = defineProps<{
@@ -14,10 +14,12 @@ const emit = defineEmits<{
   (e: "toggle", id: string): void;
 }>();
 
-// 手牌排序：按点数从大到小（斗地主习惯）
+// 手牌排序：按斗地主牌力从大到小（大王 > 小王 > 2 > A > K …）
 const sortedCards = computed(() => {
   return [...props.cards].sort((a, b) => {
-    if (b.rank !== a.rank) return b.rank - a.rank;
+    const va = ddzValue(a);
+    const vb = ddzValue(b);
+    if (vb !== va) return vb - va;
     const order: Record<string, number> = { spades: 0, hearts: 1, clubs: 2, diamonds: 3, joker: 4 };
     return order[a.suit] - order[b.suit];
   });
@@ -56,7 +58,7 @@ function cardStyle(i: number) {
 </script>
 
 <template>
-  <div class="flex min-h-[112px] items-end justify-center px-4 pb-1">
+  <div class="flex min-h-[104px] items-end justify-center px-4 pb-0.5">
     <div
       v-for="(card, i) in sortedCards"
       :key="card.id"

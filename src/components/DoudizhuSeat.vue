@@ -21,12 +21,12 @@ const initial = computed(() => (props.player.name || "?").slice(0, 1));
 
 <template>
   <div
-    class="flex w-[172px] flex-col items-center gap-1.5 transition-all"
+    class="flex w-[150px] flex-col items-center gap-1 transition-all"
     :class="isCurrent ? 'scale-105' : ''"
   >
     <!-- 座位卡片 -->
     <div
-      class="seat-card relative flex w-full items-center gap-2.5 rounded-2xl px-3 py-2"
+      class="seat-card relative flex w-full items-center gap-2 rounded-xl px-2 py-1.5"
       :class="isCurrent ? 'turn-ring' : ''"
     >
       <!-- 头像 -->
@@ -34,13 +34,13 @@ const initial = computed(() => (props.player.name || "?").slice(0, 1));
         <img
           v-if="agent?.avatar"
           :src="agent.avatar"
-          class="h-11 w-11 rounded-full border-2 object-cover shadow-lg"
+          class="h-9 w-9 rounded-full border-2 object-cover shadow-lg"
           :class="isCurrent ? 'avatar-ring-active border-amber-300' : 'border-white/60'"
           alt=""
         />
         <div
           v-else
-          class="flex h-11 w-11 items-center justify-center rounded-full border-2 text-lg font-black text-white shadow-lg"
+          class="flex h-9 w-9 items-center justify-center rounded-full border-2 text-base font-black text-white shadow-lg"
           :class="[
             agent ? agent.color + ' ' + agent.color2 : 'bg-gradient-to-br from-amber-400 to-amber-700',
             isCurrent ? 'avatar-ring-active' : '',
@@ -57,7 +57,7 @@ const initial = computed(() => (props.player.name || "?").slice(0, 1));
 
       <div class="min-w-0 flex-1">
         <div class="flex items-center gap-1">
-          <span class="truncate text-sm font-bold text-white">{{ player.name }}</span>
+          <span class="truncate text-[13px] font-bold leading-tight text-white">{{ player.name }}</span>
           <span
             v-if="player.role === 'landlord'"
             class="shrink-0 rounded bg-amber-500/90 px-1.5 py-0.5 text-[10px] font-bold text-amber-950"
@@ -99,7 +99,7 @@ const initial = computed(() => (props.player.name || "?").slice(0, 1));
     </div>
 
     <!-- 最近一次出牌（在 agent 面前，下次出牌覆盖） -->
-    <div class="flex min-h-[60px] items-center justify-center">
+    <div class="flex min-h-[46px] items-center justify-center">
       <div
         v-if="lastPlay.length"
         class="flex items-center gap-1 rounded-xl border border-amber-300/25 bg-black/40 px-2 py-1 shadow"

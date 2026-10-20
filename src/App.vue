@@ -30,6 +30,9 @@ function enterActiveGame() {
 
 onMounted(() => {
   setSoundEnabled(store.settings.sound);
+  // 支持 ?view=doudizhu / ?view=holdem 直达某个页面（调试与联调用）
+  const v = new URLSearchParams(location.search).get("view");
+  if (v && v in viewMap) store.view = v as keyof typeof viewMap;
 });
 </script>
 

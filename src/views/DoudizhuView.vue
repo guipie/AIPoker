@@ -16,7 +16,7 @@ import {
   suggestLead,
 } from "../engine/doudizhu";
 import { llmDdzBid, llmDdzDecision, type LlmConfig } from "../engine/llm";
-import { agentById, addMatchLog, pickAgents, recordResult, store } from "../store";
+import { addMatchLog, agentById, pickAgents, recordResult, store } from "../store";
 import { checkAgents, configForAgent, shouldUseLlm, type AgentConnResult } from "../utils/llmCheck";
 import { newLogId, type MatchLogEntry } from "../utils/matchLog";
 
@@ -244,7 +244,7 @@ function finalizeMatch(win: boolean) {
       players: seats.map((h: SeatSnap) => ({
         name: h.pid === 0 ? "你" : h.name,
         role: h.role,
-        agent: h.pid === 0 ? "（你本人）" : (agentById(agentMap.value[h.pid] ?? "")?.name ?? ""),
+        agent: h.pid === 0 ? "（你本人）" : agentById(agentMap.value[h.pid] ?? "")?.name ?? "",
         hand: h.hand,
       })),
       landlordName: landlord?.name ?? "",
@@ -740,17 +740,19 @@ function openModelEditor(id: number) {
 
 // 对手座位定位：你（人类）在底部，对手沿上弧排开
 // 2 个对手 → 左上 / 右上；3 个对手 → 左上 / 上中(对面) / 右上
+// 座位沿上弧排开；中央 48% 处是「需压过的牌」，座位上移让出这块区域
 function botStyle(i: number, n: number) {
-  if (n <= 1) return { left: "50%", top: "22%", transform: "translate(-50%,-50%)" };
+  const t = "translate(-50%,-50%)";
+  if (n <= 1) return { left: "50%", top: "20%", transform: t };
   if (n === 2) {
     return i === 0
-      ? { left: "26%", top: "24%", transform: "translate(-50%,-50%)" }
-      : { left: "74%", top: "24%", transform: "translate(-50%,-50%)" };
+      ? { left: "27%", top: "21%", transform: t }
+      : { left: "73%", top: "21%", transform: t };
   }
   const pos = [
-    { left: "22%", top: "40%", transform: "translate(-50%,-50%)" },
-    { left: "50%", top: "25%", transform: "translate(-50%,-50%)" },
-    { left: "78%", top: "40%", transform: "translate(-50%,-50%)" },
+    { left: "22%", top: "34%", transform: t },
+    { left: "50%", top: "17%", transform: t },
+    { left: "78%", top: "34%", transform: t },
   ];
   return pos[i] ?? pos[0];
 }
@@ -776,7 +778,7 @@ onDeactivated(() => {
   >
     <!-- 顶栏 -->
     <header
-      class="z-20 flex h-14 shrink-0 items-center justify-between border-b border-white/10 bg-black/40 px-4 shadow-lg backdrop-blur"
+      class="z-20 flex h-12 shrink-0 items-center justify-between border-b border-white/10 bg-black/40 px-4 shadow-lg backdrop-blur"
     >
       <button class="btn-ghost rounded-lg px-3 py-1.5 text-sm" @click="backToPlaza">← 广场</button>
       <div class="flex-1 px-4 text-center text-sm text-white/80">{{ state?.message ?? "" }}</div>
@@ -819,14 +821,14 @@ onDeactivated(() => {
     </header>
 
     <!-- 牌桌 -->
-    <div class="relative flex flex-1 items-center justify-center px-3 py-3">
-      <div class="wood-rail relative h-full w-full max-w-[1240px] rounded-[150px] p-3">
+    <div class="relative flex flex-1 items-center justify-center px-3 py-2">
+      <div class="wood-rail relative h-full w-full max-w-[1240px] rounded-[150px] p-2.5">
         <div class="felt-table relative h-full w-full overflow-hidden rounded-[130px]">
           <div class="felt-weave pointer-events-none absolute inset-0"></div>
           <div
             class="table-emblem pointer-events-none absolute inset-0 flex items-center justify-center"
           >
-            <svg viewBox="0 0 100 100" class="h-64 w-64 text-amber-100" fill="currentColor">
+            <svg viewBox="0 0 100 100" class="h-52 w-52 text-amber-100" fill="currentColor">
               <path
                 d="M50 6C50 6 20 33 20 53c0 13 11 20 20 15-4 9-9 16-16 21h52c-7-5-12-12-16-21 9 5 20-2 20-15C80 33 50 6 50 6z"
               />
@@ -853,8 +855,10 @@ onDeactivated(() => {
               @edit-model="openModelEditor(p.id)"
             />
           </div>
-
-          <div class="absolute inset-0 flex flex-col items-center justify-center gap-4">
+          <!-- 中央区：需压过的牌（上移到牌桌中上部，底牌消失后的空位正好给它用） -->
+          <div
+            class="pointer-events-none absolute inset-x-0 top-[48%] z-10 flex -translate-y-1/2 flex-col items-center gap-1.5"
+          >
             <!-- 地主底牌：只在叫地主阶段展示，开打后收起（牌桌放不下） -->
             <div
               v-if="isBidding && state && state.landlordCards.length > 0"
@@ -866,36 +870,46 @@ onDeactivated(() => {
               </div>
             </div>
 
-            <!-- 中央需压过的牌 -->
-            <div class="flex min-h-[96px] items-center justify-center">
+            <div class="flex min-h-[92px] items-center justify-center">
               <div
                 v-if="!centerCards.length || centerCards.length == 0"
                 class="text-sm text-white/40"
               >
                 桌面空闲
               </div>
-              <div v-else class="flex animate-card-fly">
-                <div
-                  v-for="(c, i) in centerCards"
-                  :key="c.id"
-                  :style="{ marginLeft: i === 0 ? '0' : '-26px', zIndex: i }"
-                >
-                  <CardComp :card="c" />
+              <div v-else class="flex flex-col items-center gap-1">
+                <div class="flex animate-card-fly">
+                  <div
+                    v-for="(c, i) in centerCards"
+                    :key="c.id"
+                    :style="{ marginLeft: i === 0 ? '0' : '-26px', zIndex: i }"
+                  >
+                    <CardComp :card="c" />
+                  </div>
                 </div>
+                <span
+                  v-if="state?.lastPlayerId != null"
+                  class="rounded-full bg-black/50 px-2 py-0.5 text-[10px] text-amber-200/85"
+                >
+                  {{ state.players[state.lastPlayerId]?.name }} 打出
+                </span>
               </div>
             </div>
+          </div>
 
+          <!-- 底部：叫地主 / 轮次提示 -->
+          <div class="absolute inset-x-0 bottom-2 flex flex-col items-center">
             <!-- 叫地主 -->
-            <div v-if="isBidding" class="flex flex-col items-center gap-2">
-              <div class="text-base font-bold text-amber-200">
+            <div v-if="isBidding" class="flex flex-col items-center gap-1.5">
+              <div class="text-sm font-bold text-amber-200">
                 叫地主（当前最高 {{ currentBid }} 分）
               </div>
               <div v-if="isMyTurn" class="flex gap-2">
-                <button class="btn btn-chip-pass px-5 py-2 text-sm" @click="bid(0)">不叫</button>
+                <button class="btn btn-chip-pass px-5 py-1.5 text-sm" @click="bid(0)">不叫</button>
                 <button
                   v-for="s in [1, 2, 3]"
                   :key="s"
-                  class="btn btn-chip px-5 py-2 text-sm"
+                  class="btn btn-chip px-5 py-1.5 text-sm"
                   :disabled="s <= currentBid"
                   @click="bid(s)"
                 >
@@ -924,7 +938,10 @@ onDeactivated(() => {
               >
                 轮到你出牌
               </span>
-              <span v-else class="text-white/50">
+              <span
+                v-else
+                class="rounded-full bg-amber-500/85 px-3 py-1 font-bold text-amber-950 shadow"
+              >
                 等待
                 {{ state?.players.find((p: any) => p.id === state.currentPlayerId)?.name }} 出牌…
               </span>
@@ -936,7 +953,7 @@ onDeactivated(() => {
 
     <!-- 底部：自己 + 手牌 + 操作 -->
     <footer
-      class="z-20 shrink-0 border-t border-white/10 bg-black/45 px-4 pb-3 pt-2 shadow-[0_-8px_24px_rgba(0,0,0,0.45)]"
+      class="z-20 shrink-0 border-t border-white/10 bg-black/45 px-4 pb-2.5 pt-2 shadow-[0_-8px_24px_rgba(0,0,0,0.45)]"
     >
       <div class="mb-1 flex items-center justify-center gap-3 text-sm">
         <div class="flex items-center gap-2">
@@ -971,14 +988,12 @@ onDeactivated(() => {
             4 人局（无大小王）
           </span>
         </div>
-      </div>
 
-      <!-- 你最近一次出牌（在你面前展示，下次出牌覆盖） -->
-      <div v-if="meLastPlay.length" class="mb-1 flex items-center justify-center">
+        <!-- 你最近一次出牌（合并进信息行，省一整行高度；下次出牌覆盖） -->
         <div
-          class="flex items-center gap-1.5 rounded-xl border border-amber-300/30 bg-black/45 px-3 py-1 shadow"
+          v-if="meLastPlay.length"
+          class="flex items-center gap-1.5 rounded-xl border border-amber-300/30 bg-black/45 px-2 py-0.5 shadow"
         >
-          <!-- <span class="text-[10px] tracking-wide text-amber-200/80">你出过</span> -->
           <div
             v-for="(c, i) in meLastPlay"
             :key="c.id"
@@ -999,29 +1014,30 @@ onDeactivated(() => {
         @toggle="toggleCard"
       />
 
-      <div class="mt-1.5 flex min-h-[18px] items-center justify-center">
+      <div class="mt-1 flex min-h-[16px] items-center justify-center">
         <span
           v-if="hintMsg"
-          class="rounded-full px-3 py-0.5 text-xs"
+          class="rounded-full px-3 py-0.5 text-[11px]"
           :class="hintEmpty ? 'bg-rose-500/20 text-rose-300' : 'bg-emerald-500/15 text-emerald-300'"
         >
           {{ hintMsg }}
         </span>
       </div>
-      <div v-if="isPlaying" class="mt-2 flex justify-center gap-4">
+      <div v-if="isPlaying" class="mt-1.5 flex justify-center gap-4">
         <button
-          class="btn btn-primary px-7 py-2.5"
+          class="btn btn-primary px-6 py-2"
           :disabled="!isMyTurn || selectedIds.size === 0"
           @click="playSelected"
         >
           出牌
         </button>
-        <button class="btn btn-slate px-7 py-2.5" :disabled="!isMyTurn" @click="pass">不出</button>
-        <button class="btn btn-gold px-7 py-2.5" :disabled="!isMyTurn" @click="hint">
-          提示<span v-if="hintOptions.length">（{{ hintIdx + 1 }}/{{ hintOptions.length }}）</span>
+        <button class="btn btn-slate px-6 py-2" :disabled="!isMyTurn" @click="pass">不出</button>
+        <button class="btn btn-gold px-6 py-2" :disabled="!isMyTurn" @click="hint">
+          提示
+          <span v-if="hintOptions.length">（{{ hintIdx + 1 }}/{{ hintOptions.length }}）</span>
         </button>
       </div>
-      <div v-else class="mt-2 h-[52px]"></div>
+      <div v-else class="mt-1.5 h-[30px]"></div>
     </footer>
 
     <!-- 结算 -->
