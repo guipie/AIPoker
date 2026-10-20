@@ -3,6 +3,7 @@ import { computed, nextTick, onActivated, onDeactivated, onMounted, ref } from "
 import { sfx } from "../audio/sfx";
 import CardComp from "../components/Card.vue";
 import HoldemSeat from "../components/HoldemSeat.vue";
+import AgentModelEditor from "../components/AgentModelEditor.vue";
 import { SUIT_SYMBOL, rankLabel, type Card } from "../engine/cards";
 import {
   HoldemGame,
@@ -147,6 +148,9 @@ async function requestNewGame(ids?: string[]) {
       sfx.lose();
       return; // 连接失败：不开始牌局
     }
+    applyOnline(res); // 记录各 agent 的在线状态
+  } else {
+    agentOnline.value = {};
   }
   buildAgentsFromList(list);
 }
@@ -350,6 +354,58 @@ function goSettings() {
   store.view = "settings";
 }
 
+// ===== 牌桌上各 agent 的大模型在线状态 =====
+const agentOnline = ref<Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }>>({});
+const showEditor = ref(false);
+const editAgentId = ref<string | null>(null);
+
+function connFor(id: number) {
+  const aid = agentMap.value[id];
+  return aid ? agentOnline.value[aid] : undefined;
+}
+
+function applyOnline(res: AgentConnResult[]) {
+  const map: Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }> = {};
+  for (const r of res) {
+    const a = agentById(r.id);
+    map[r.id] = { ok: r.ok, model: a?.model ?? store.settings.model, error: r.error };
+  }
+  agentOnline.value = map;
+}
+
+/** 重新检测牌桌上所有 agent（不阻断牌局，仅更新状态徽章） */
+async function recheckAgents() {
+  const ids = agentIdsList.value;
+  if (!store.settings.enabled || !ids.length) {
+    agentOnline.value = {};
+    return;
+  }
+  applyOnline(await checkAgents(ids));
+}
+
+/** 某个 agent 的模型配置被修改后，单独重检它 */
+async function recheckOne(id: string) {
+  agentOnline.value = {
+    ...agentOnline.value,
+    [id]: { ok: false, model: agentById(id)?.model ?? store.settings.model, checking: true },
+  };
+  const r = (await checkAgents([id]))[0];
+  if (r) {
+    agentOnline.value = {
+      ...agentOnline.value,
+      [id]: { ok: r.ok, model: agentById(id)?.model ?? store.settings.model, error: r.error },
+    };
+  }
+}
+
+function openModelEditor(id: number) {
+  const aid = agentMap.value[id];
+  if (!aid) return;
+  sfx.click();
+  editAgentId.value = aid;
+  showEditor.value = true;
+}
+
 const humanWon = computed(() => state.value?.winners.includes(0) ?? false);
 
 onMounted(maybeStart);
@@ -375,10 +431,19 @@ onDeactivated(() => {
       <div class="flex items-center gap-2">
         <span
           v-if="store.settings.enabled"
-          class="rounded-full bg-gradient-to-r from-fuchsia-600 to-violet-600 px-2 py-0.5 text-[10px] font-bold"
+          class="rounded-full bg-gradient-to-r from-emerald-500 to-green-600 px-2 py-0.5 text-[10px] font-bold text-white shadow"
+          title="已启用大模型大脑；未启用时对手使用内置规则引擎"
         >
-          LLM 在线
+          LLM 启用
         </span>
+        <button
+          v-if="store.settings.enabled"
+          class="btn-ghost rounded-lg px-2 py-1.5 text-sm"
+          @click="recheckAgents"
+          title="重新检测牌桌上各 agent 的大模型连通性"
+        >
+          ⟳
+        </button>
         <button
           class="btn-ghost rounded-lg px-2 py-1.5 text-sm"
           :disabled="agentIdsList.length >= 8"
@@ -423,6 +488,8 @@ onDeactivated(() => {
               :reveal="isHandOver"
               :winner="state?.winners.includes(p.id) ?? false"
               :compact="bots.length > 5"
+              :conn="connFor(p.id)"
+              @edit-model="openModelEditor(p.id)"
             />
           </div>
 
@@ -623,5 +690,12 @@ onDeactivated(() => {
         </div>
       </div>
     </div>
+    <!-- 修改某个 agent 的模型配置（与广场共用同一个弹窗） -->
+    <AgentModelEditor
+      :open="showEditor"
+      :agent-id="editAgentId"
+      @close="showEditor = false"
+      @saved="recheckOne"
+    />
   </div>
 </template>

@@ -3,6 +3,7 @@ import { computed, onActivated, onDeactivated, onMounted, ref } from "vue";
 import { sfx } from "../audio/sfx";
 import CardComp from "../components/Card.vue";
 import DoudizhuSeat from "../components/DoudizhuSeat.vue";
+import AgentModelEditor from "../components/AgentModelEditor.vue";
 import HandCards from "../components/HandCards.vue";
 import { SUIT_SYMBOL, rankLabel, type Card } from "../engine/cards";
 import {
@@ -90,14 +91,16 @@ function buildDdzInput(s: any, player: any) {
   const myRole = player.role;
   const teammates =
     myRole === "farmer"
-      ? s.players.filter((p: any) => p.role === "farmer" && p.id !== player.id).map((p: any) => p.name)
+      ? s.players
+          .filter((p: any) => p.role === "farmer" && p.id !== player.id)
+          .map((p: any) => p.name)
       : [];
   const opponents =
     myRole === "landlord"
       ? s.players.filter((p: any) => p.id !== player.id).map((p: any) => p.name)
       : landlord
-        ? [landlord.name]
-        : [];
+      ? [landlord.name]
+      : [];
 
   const seats = s.players.map((p: any) => ({
     name: p.id === player.id ? `${p.name}（我）` : p.name,
@@ -108,13 +111,15 @@ function buildDdzInput(s: any, player: any) {
 
   const recentActions = (s.recentActions ?? []).map((a: any) => {
     const who = s.players[a.playerId]?.name ?? "?";
-    return a.type === "pass" ? `${who}：不出` : `${who}：出 ${(a.cards ?? []).map(ddzLabel).join(" ")}`;
+    return a.type === "pass"
+      ? `${who}：不出`
+      : `${who}：出 ${(a.cards ?? []).map(ddzLabel).join(" ")}`;
   });
 
   return {
     hand: player.hand.map(ddzLabel),
     lastPlay: s.lastPlay ? s.lastPlay.map(ddzLabel) : null,
-    lastPlayerName: s.lastPlayerId != null ? (s.players[s.lastPlayerId]?.name ?? null) : null,
+    lastPlayerName: s.lastPlayerId != null ? s.players[s.lastPlayerId]?.name ?? null : null,
     freeLead: !s.lastPlay,
     myRole: roleText(myRole),
     landlordName: landlord ? landlord.name : "（尚未确定）",
@@ -152,12 +157,15 @@ async function requestNewGame(ids?: string[]) {
     connErrors.value = [];
     const res = await checkAgents(list);
     connChecking.value = false;
-    const bad = res.filter((r) => !r.ok);
+    const bad = res.filter(r => !r.ok);
     if (bad.length) {
       connErrors.value = bad;
       sfx.lose();
       return; // 连接失败：不开始牌局
     }
+    applyOnline(res); // 记录各 agent 的在线状态
+  } else {
+    agentOnline.value = {};
   }
   newGame(list);
 }
@@ -357,6 +365,57 @@ function goSettings() {
   store.view = "settings";
 }
 
+// ===== 牌桌上各 agent 的大模型在线状态 =====
+const agentOnline = ref<Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }>>({});
+const showEditor = ref(false);
+const editAgentId = ref<string | null>(null);
+
+function connFor(id: number) {
+  const aid = agentMap.value[id];
+  return aid ? agentOnline.value[aid] : undefined;
+}
+
+function applyOnline(res: AgentConnResult[]) {
+  const map: Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }> = {};
+  for (const r of res) {
+    const a = agentById(r.id);
+    map[r.id] = { ok: r.ok, model: a?.model ?? store.settings.model, error: r.error };
+  }
+  agentOnline.value = map;
+}
+
+/** 重新检测牌桌上所有 agent（不阻断牌局，仅更新状态徽章） */
+async function recheckAgents() {
+  const ids = agentIds.value;
+  if (!store.settings.enabled || !ids.length) {
+    agentOnline.value = {};
+    return;
+  }
+  applyOnline(await checkAgents(ids));
+}
+
+/** 某个 agent 的模型配置被修改后，单独重检它 */
+async function recheckOne(id: string) {
+  const model = agentById(id)?.model ?? store.settings.model;
+  agentOnline.value = { ...agentOnline.value, [id]: { ok: false, model, checking: true } };
+  const res = await checkAgents([id]);
+  const r = res[0];
+  if (r) {
+    agentOnline.value = {
+      ...agentOnline.value,
+      [id]: { ok: r.ok, model: agentById(id)?.model ?? store.settings.model, error: r.error },
+    };
+  }
+}
+
+function openModelEditor(id: number) {
+  const aid = agentMap.value[id];
+  if (!aid) return;
+  sfx.click();
+  editAgentId.value = aid;
+  showEditor.value = true;
+}
+
 // 对手座位定位：你（人类）在底部，对手沿上弧排开
 // 2 个对手 → 左上 / 右上；3 个对手 → 左上 / 上中(对面) / 右上
 function botStyle(i: number, n: number) {
@@ -367,9 +426,9 @@ function botStyle(i: number, n: number) {
       : { left: "74%", top: "24%", transform: "translate(-50%,-50%)" };
   }
   const pos = [
-    { left: "22%", top: "27%", transform: "translate(-50%,-50%)" },
-    { left: "50%", top: "14%", transform: "translate(-50%,-50%)" },
-    { left: "78%", top: "27%", transform: "translate(-50%,-50%)" },
+    { left: "22%", top: "40%", transform: "translate(-50%,-50%)" },
+    { left: "50%", top: "25%", transform: "translate(-50%,-50%)" },
+    { left: "78%", top: "40%", transform: "translate(-50%,-50%)" },
   ];
   return pos[i] ?? pos[0];
 }
@@ -402,10 +461,19 @@ onDeactivated(() => {
       <div class="flex items-center gap-2">
         <span
           v-if="store.settings.enabled"
-          class="rounded-full bg-gradient-to-r from-fuchsia-600 to-violet-600 px-2 py-0.5 text-[10px] font-bold"
+          class="rounded-full bg-gradient-to-r from-emerald-500 to-green-600 px-2 py-0.5 text-[10px] font-bold text-white shadow"
+          title="已启用大模型大脑；未启用时对手使用内置规则引擎"
         >
-          LLM 在线
+          LLM 启用
         </span>
+        <button
+          v-if="store.settings.enabled"
+          class="btn-ghost rounded-lg px-2 py-1.5 text-sm"
+          @click="recheckAgents"
+          title="重新检测牌桌上各 agent 的大模型连通性"
+        >
+          ⟳
+        </button>
         <button
           class="btn-ghost rounded-lg px-2 py-1.5 text-sm"
           :disabled="agentIds.length >= 3"
@@ -422,7 +490,9 @@ onDeactivated(() => {
         >
           ➖
         </button>
-        <button class="btn-ghost rounded-lg px-3 py-1.5 text-sm" @click="requestNewGame()">重开</button>
+        <button class="btn-ghost rounded-lg px-3 py-1.5 text-sm" @click="requestNewGame()">
+          重开
+        </button>
       </div>
     </header>
 
@@ -449,11 +519,17 @@ onDeactivated(() => {
             :style="botStyle(Number(index), bots.length)"
           >
             <div
-              class="mb-0.5 rounded-full bg-black/55 px-2 py-0.5 text-[10px] font-bold tracking-wide text-amber-200 shadow"
+              class="mb-1 rounded-full bg-black/55 px-2 py-0.5 text-[10px] font-bold tracking-wide text-amber-200 shadow"
             >
               {{ positionLabel(Number(index), bots.length) }}
             </div>
-            <DoudizhuSeat :player="p" :agent="agentFor(p.id)" :is-current="thinkingId === p.id" />
+            <DoudizhuSeat
+              :player="p"
+              :agent="agentFor(p.id)"
+              :is-current="thinkingId === p.id"
+              :conn="connFor(p.id)"
+              @edit-model="openModelEditor(p.id)"
+            />
           </div>
 
           <div class="absolute inset-0 flex flex-col items-center justify-center gap-4">
@@ -653,11 +729,17 @@ onDeactivated(() => {
       >
         <div class="text-3xl">🔌</div>
         <div class="text-sm text-white/80">正在检测牌桌上所有 AI 对手的大模型连接…</div>
-        <span class="flex gap-1"
-          ><i class="thinking-dot h-2 w-2 rounded-full bg-amber-300"></i
-          ><i class="thinking-dot h-2 w-2 rounded-full bg-amber-300" style="animation-delay: 0.18s"></i
-          ><i class="thinking-dot h-2 w-2 rounded-full bg-amber-300" style="animation-delay: 0.36s"></i
-        ></span>
+        <span class="flex gap-1">
+          <i class="thinking-dot h-2 w-2 rounded-full bg-amber-300"></i>
+          <i
+            class="thinking-dot h-2 w-2 rounded-full bg-amber-300"
+            style="animation-delay: 0.18s"
+          ></i>
+          <i
+            class="thinking-dot h-2 w-2 rounded-full bg-amber-300"
+            style="animation-delay: 0.36s"
+          ></i>
+        </span>
       </div>
     </div>
 
@@ -671,7 +753,9 @@ onDeactivated(() => {
       >
         <div class="mb-1 text-4xl">🔌</div>
         <div class="mb-1 text-xl font-black text-rose-200">大模型连接失败，无法开始牌局</div>
-        <div class="mb-4 text-sm text-white/70">以下 AI 对手无法连通其大模型，请检查 Key / 接口地址：</div>
+        <div class="mb-4 text-sm text-white/70">
+          以下 AI 对手无法连通其大模型，请检查 Key / 接口地址：
+        </div>
         <div class="mb-4 max-h-52 space-y-2 overflow-y-auto text-left">
           <div
             v-for="e in connErrors"
@@ -687,11 +771,20 @@ onDeactivated(() => {
           或到「设置」修正全局 Key，或关闭大模型改用内置规则引擎。
         </div>
         <div class="flex flex-wrap justify-center gap-3">
-          <button class="btn btn-slate px-5 py-2 text-sm" @click="requestNewGame(lastList)">重试</button>
+          <button class="btn btn-slate px-5 py-2 text-sm" @click="requestNewGame(lastList)">
+            重试
+          </button>
           <button class="btn btn-ghost px-5 py-2 text-sm" @click="goSettings">去设置</button>
           <button class="btn btn-primary px-5 py-2 text-sm" @click="backToPlaza">返回广场</button>
         </div>
       </div>
     </div>
+    <!-- 修改某个 agent 的模型配置（与广场共用同一个弹窗） -->
+    <AgentModelEditor
+      :open="showEditor"
+      :agent-id="editAgentId"
+      @close="showEditor = false"
+      @saved="recheckOne"
+    />
   </div>
 </template>

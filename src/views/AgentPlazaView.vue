@@ -1,19 +1,9 @@
 <script setup lang="ts">
-import { ref, reactive, computed } from "vue";
-import {
-  store,
-  allAgents,
-  agentById,
-  toggleDefault,
-  addCustomAgent,
-  saveAgentOverride,
-  clearAgentOverride,
-  updateCustomAgent,
-  beginGame,
-  type AgentDef,
-} from "../store";
+import { computed, reactive, ref } from "vue";
 import { sfx } from "../audio/sfx";
 import { testLlmConnection, type LlmConfig } from "../engine/llm";
+import AgentModelEditor from "../components/AgentModelEditor.vue";
+import { addCustomAgent, allAgents, beginGame, store, toggleDefault, type AgentDef } from "../store";
 
 const agents = computed(() => allAgents());
 const selected = computed(() => new Set(store.selectedAgentIds));
@@ -21,8 +11,12 @@ const selected = computed(() => new Set(store.selectedAgentIds));
 const MAX = 8; // 德州最多 8 个对手（共 9 人）
 
 // 开始按钮可用性
-const ddzOk = computed(() => store.selectedAgentIds.length >= 2 && store.selectedAgentIds.length <= 3);
-const holdemOk = computed(() => store.selectedAgentIds.length >= 5 && store.selectedAgentIds.length <= 8);
+const ddzOk = computed(
+  () => store.selectedAgentIds.length >= 2 && store.selectedAgentIds.length <= 3
+);
+const holdemOk = computed(
+  () => store.selectedAgentIds.length >= 5 && store.selectedAgentIds.length <= 8
+);
 
 function ddHint() {
   const n = store.selectedAgentIds.length;
@@ -104,59 +98,14 @@ function openModal() {
 const saving = ref(false);
 
 // ===== 修改某个 agent 的模型配置（内置 agent 也支持，持久化覆盖） =====
+// 弹窗抽成共享组件 AgentModelEditor，牌桌上的状态徽章也复用同一个弹窗
 const showEdit = ref(false);
-const editTarget = ref<AgentDef | null>(null);
-const editForm = reactive({ baseUrl: "", apiKey: "", model: "" });
-const editError = ref("");
-const editTesting = ref(false);
-const editIsCustom = computed(() => !!editTarget.value?.isCustom);
-const editHasOverride = computed(
-  () => !!editTarget.value && !!store.agentOverrides[editTarget.value.id],
-);
+const editId = ref<string | null>(null);
 
 function openEdit(a: AgentDef) {
   sfx.click();
-  editTarget.value = a;
-  // 预填当前生效配置：覆盖值 / 自定义值；都没有则留空（回落全局）
-  editForm.baseUrl = a.baseUrl ?? "";
-  editForm.apiKey = a.apiKey ?? "";
-  editForm.model = a.model ?? store.settings.model;
-  editError.value = "";
+  editId.value = a.id;
   showEdit.value = true;
-}
-
-async function saveEdit() {
-  const t = editTarget.value;
-  if (!t) return;
-  editTesting.value = true;
-  editError.value = "正在检测大模型连接…";
-  const cfg: LlmConfig = {
-    enabled: store.settings.enabled,
-    baseUrl: editForm.baseUrl.trim() || store.settings.baseUrl,
-    model: editForm.model.trim() || store.settings.model,
-    apiKey: editForm.apiKey.trim() || store.settings.apiKey,
-    persona: t.persona ?? "",
-    temperature: store.settings.temperature,
-  };
-  const r = await testLlmConnection(cfg);
-  editTesting.value = false;
-  if (!r.ok) {
-    editError.value = "大模型连接失败：" + r.error;
-    return;
-  }
-  editError.value = "";
-  if (t.isCustom) updateCustomAgent(t.id, { ...editForm });
-  else saveAgentOverride(t.id, { ...editForm });
-  sfx.click();
-  showEdit.value = false;
-}
-
-function resetOverride() {
-  const t = editTarget.value;
-  if (!t || t.isCustom) return;
-  sfx.click();
-  clearAgentOverride(t.id);
-  showEdit.value = false;
 }
 
 async function saveCustom() {
@@ -212,11 +161,16 @@ async function saveCustom() {
 </script>
 
 <template>
-  <div class="h-full overflow-y-auto px-6 py-8" style="background: radial-gradient(ellipse at 50% -10%, #2b1d11 0%, #150f08 55%, #0a0705 100%)">
+  <div
+    class="h-full overflow-y-auto px-6 py-8"
+    style="background: radial-gradient(ellipse at 50% -10%, #2b1d11 0%, #150f08 55%, #0a0705 100%)"
+  >
     <div class="mx-auto max-w-5xl">
-      <div class="mb-1 flex items-center justify-between">
+      <div class="mb-4 flex items-center justify-between">
         <div class="text-3xl font-black text-amber-100">🤖 Agent 广场</div>
-        <button class="btn btn-gold px-4 py-2 text-sm" @click="openModal">＋ 新增自定义大模型</button>
+        <button class="btn btn-gold px-4 py-2 text-sm" @click="openModal">
+          ＋ 新增自定义大模型
+        </button>
       </div>
       <p class="mb-4 text-sm text-amber-100/60">
         点选卡片多选对手；点 ★ 设为「默认」（开局优先显示，没有默认则随机）。选好后右上角直接开局。
@@ -225,19 +179,41 @@ async function saveCustom() {
       </p>
 
       <!-- 右上角开始按钮 -->
-      <div class="sticky top-0 z-20 mb-4 flex flex-wrap items-center justify-end gap-3 rounded-2xl border border-white/10 bg-black/40 px-4 py-3 backdrop-blur">
+      <div
+        class="sticky top-0 z-20 mb-4 flex flex-wrap items-center justify-end gap-3 rounded-2xl border border-white/10 bg-black/40 px-4 py-3 backdrop-blur"
+      >
         <span class="mr-auto text-xs text-white/55">多选对手后开局：</span>
         <div class="group relative">
-          <button class="btn px-5 py-2.5 text-sm" :class="ddzOk ? 'btn-rose' : 'btn-slate opacity-50'" :disabled="!ddzOk" @click="startDdz">
+          <button
+            class="btn px-5 py-2.5 text-sm"
+            :class="ddzOk ? 'btn-rose' : 'btn-slate opacity-50'"
+            :disabled="!ddzOk"
+            @click="startDdz"
+          >
             🃏 开始斗地主
           </button>
-          <span v-if="!ddzOk" class="pointer-events-none absolute right-0 top-full mt-1 hidden w-56 rounded-lg bg-black/90 px-3 py-2 text-[11px] text-amber-100 shadow-lg group-hover:block">{{ ddHint() }}</span>
+          <span
+            v-if="!ddzOk"
+            class="pointer-events-none absolute right-0 top-full mt-1 hidden w-56 rounded-lg bg-black/90 px-3 py-2 text-[11px] text-amber-100 shadow-lg group-hover:block"
+          >
+            {{ ddHint() }}
+          </span>
         </div>
         <div class="group relative">
-          <button class="btn px-5 py-2.5 text-sm" :class="holdemOk ? 'btn-rose' : 'btn-slate opacity-50'" :disabled="!holdemOk" @click="startHoldem">
+          <button
+            class="btn px-5 py-2.5 text-sm"
+            :class="holdemOk ? 'btn-rose' : 'btn-slate opacity-50'"
+            :disabled="!holdemOk"
+            @click="startHoldem"
+          >
             ♠ 开始德州
           </button>
-          <span v-if="!holdemOk" class="pointer-events-none absolute right-0 top-full mt-1 hidden w-56 rounded-lg bg-black/90 px-3 py-2 text-[11px] text-amber-100 shadow-lg group-hover:block">{{ holdemHint() }}</span>
+          <span
+            v-if="!holdemOk"
+            class="pointer-events-none absolute right-0 top-full mt-1 hidden w-56 rounded-lg bg-black/90 px-3 py-2 text-[11px] text-amber-100 shadow-lg group-hover:block"
+          >
+            {{ holdemHint() }}
+          </span>
         </div>
       </div>
 
@@ -246,14 +222,18 @@ async function saveCustom() {
           v-for="a in agents"
           :key="a.id"
           class="hover-lift relative cursor-pointer overflow-hidden rounded-3xl border bg-gradient-to-br from-white/5 to-white/[0.02] p-5 shadow-xl transition-all"
-          :class="selected.has(a.id) ? 'border-amber-400/70 ring-2 ring-amber-400/40' : 'border-white/10'"
+          :class="
+            selected.has(a.id) ? 'border-amber-400/70 ring-2 ring-amber-400/40' : 'border-white/10'
+          "
           @click="toggleSelect(a.id)"
         >
           <!-- 选中勾 -->
           <div
             v-if="selected.has(a.id)"
             class="absolute right-3 top-3 z-10 flex h-6 w-6 items-center justify-center rounded-full bg-amber-400 text-xs font-black text-amber-950 shadow"
-          >✓</div>
+          >
+            ✓
+          </div>
           <!-- 默认星 -->
           <button
             class="absolute right-3 top-3 z-20 text-xl leading-none transition-transform"
@@ -261,7 +241,11 @@ async function saveCustom() {
             :title="store.defaultAgentIds.includes(a.id) ? '取消默认' : '设为默认'"
             @click.stop="toggleStar(a.id)"
           >
-            <span :class="store.defaultAgentIds.includes(a.id) ? 'text-amber-300' : 'text-white/25'">★</span>
+            <span
+              :class="store.defaultAgentIds.includes(a.id) ? 'text-amber-300' : 'text-white/25'"
+            >
+              ★
+            </span>
           </button>
 
           <div class="absolute -right-6 -top-6 text-[90px] opacity-10">{{ a.emoji }}</div>
@@ -270,14 +254,24 @@ async function saveCustom() {
               class="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br text-2xl shadow-lg"
               :class="[a.color, a.color2]"
             >
-              <img v-if="a.avatar" :src="a.avatar" class="h-10 w-10 rounded-xl object-cover" alt="" />
+              <img
+                v-if="a.avatar"
+                :src="a.avatar"
+                class="h-10 w-10 rounded-xl object-cover"
+                alt=""
+              />
               <span v-else>{{ a.emoji }}</span>
             </span>
             <div>
               <div class="text-lg font-black text-white">{{ a.name }}</div>
               <div class="text-xs" :class="selected.has(a.id) ? 'text-amber-300' : 'text-white/55'">
                 {{ a.tagline }}
-                <span v-if="a.isCustom" class="ml-1 rounded bg-fuchsia-600/70 px-1 text-[9px] text-white">自定义</span>
+                <span
+                  v-if="a.isCustom"
+                  class="ml-1 rounded bg-fuchsia-600/70 px-1 text-[9px] text-white"
+                >
+                  自定义
+                </span>
               </div>
             </div>
           </div>
@@ -286,19 +280,39 @@ async function saveCustom() {
 
           <div class="mt-3 space-y-1.5">
             <div>
-              <div class="flex justify-between text-[10px] text-white/55"><span>激进度</span><span>{{ Math.round(a.aggression * 100) }}%</span></div>
-              <div class="h-1.5 rounded-full bg-white/10"><div class="h-full rounded-full bg-rose-500" :style="{ width: a.aggression * 100 + '%' }"></div></div>
+              <div class="flex justify-between text-[10px] text-white/55">
+                <span>激进度</span>
+                <span>{{ Math.round(a.aggression * 100) }}%</span>
+              </div>
+              <div class="h-1.5 rounded-full bg-white/10">
+                <div
+                  class="h-full rounded-full bg-rose-500"
+                  :style="{ width: a.aggression * 100 + '%' }"
+                ></div>
+              </div>
             </div>
             <div>
-              <div class="flex justify-between text-[10px] text-white/55"><span>紧度</span><span>{{ Math.round(a.tightness * 100) }}%</span></div>
-              <div class="h-1.5 rounded-full bg-white/10"><div class="h-full rounded-full bg-sky-500" :style="{ width: a.tightness * 100 + '%' }"></div></div>
+              <div class="flex justify-between text-[10px] text-white/55">
+                <span>紧度</span>
+                <span>{{ Math.round(a.tightness * 100) }}%</span>
+              </div>
+              <div class="h-1.5 rounded-full bg-white/10">
+                <div
+                  class="h-full rounded-full bg-sky-500"
+                  :style="{ width: a.tightness * 100 + '%' }"
+                ></div>
+              </div>
             </div>
           </div>
 
           <div class="mt-3 flex items-center justify-between gap-2">
             <button
               class="min-w-0 truncate rounded-full bg-black/40 px-2 py-1 text-[10px] text-emerald-200/80 transition-colors hover:bg-black/60 hover:text-amber-200"
-              :title="a.isCustom ? '修改该模型的接口/Key/模型名' : '修改该 agent 使用的大模型（接口/Key/模型名）'"
+              :title="
+                a.isCustom
+                  ? '修改该模型的接口/Key/模型名'
+                  : '修改该 agent 使用的大模型（接口/Key/模型名）'
+              "
               @click.stop="openEdit(a)"
             >
               ✏️ 模型：{{ a.model ?? "全局设置" }}
@@ -306,11 +320,21 @@ async function saveCustom() {
               <span
                 v-if="store.agentOverrides[a.id]"
                 class="ml-1 rounded bg-sky-600/80 px-1 text-[9px] text-white"
-                >已改</span
               >
+                已改
+              </span>
             </button>
-            <span class="shrink-0 text-xs" :class="selected.has(a.id) ? 'text-amber-300' : 'text-white/40'">
-              {{ selected.has(a.id) ? "已选 ✓" : (store.defaultAgentIds.includes(a.id) ? "默认 ★" : "点击选择") }}
+            <span
+              class="shrink-0 text-xs"
+              :class="selected.has(a.id) ? 'text-amber-300' : 'text-white/40'"
+            >
+              {{
+                selected.has(a.id)
+                  ? "已选 ✓"
+                  : store.defaultAgentIds.includes(a.id)
+                    ? "默认 ★"
+                    : "点击选择"
+              }}
             </span>
           </div>
         </div>
@@ -319,59 +343,138 @@ async function saveCustom() {
 
     <!-- 自定义大模型弹窗 -->
     <transition name="ball">
-      <div v-if="showModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm" @click.self="showModal = false">
-        <div class="w-[460px] max-w-full rounded-3xl border border-white/15 bg-gradient-to-b from-slate-800 to-slate-900 p-6 shadow-2xl">
+      <div
+        v-if="showModal"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+        @click.self="showModal = false"
+      >
+        <div
+          class="w-[460px] max-w-full rounded-3xl border border-white/15 bg-gradient-to-b from-slate-800 to-slate-900 p-6 shadow-2xl"
+        >
           <div class="mb-4 text-xl font-black text-amber-100">＋ 新增自定义大模型对手</div>
 
           <div class="space-y-3">
             <div class="flex gap-3">
               <div class="w-20 shrink-0">
                 <label class="mb-1 block text-xs font-semibold text-white/70">头像</label>
-                <div class="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-amber-400 to-amber-700 text-2xl shadow">
-                  <img v-if="form.avatar" :src="form.avatar" class="h-12 w-12 rounded-xl object-cover" alt="" />
+                <div
+                  class="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-amber-400 to-amber-700 text-2xl shadow"
+                >
+                  <img
+                    v-if="form.avatar"
+                    :src="form.avatar"
+                    class="h-12 w-12 rounded-xl object-cover"
+                    alt=""
+                  />
                   <span v-else>{{ form.emoji }}</span>
                 </div>
-                <input v-model="form.emoji" maxlength="2" class="mt-1 w-full rounded border border-white/15 bg-black/40 px-1 py-0.5 text-center text-sm text-white" placeholder="🤖" />
+                <input
+                  v-model="form.emoji"
+                  maxlength="2"
+                  class="mt-1 w-full rounded border border-white/15 bg-black/40 px-1 py-0.5 text-center text-sm text-white"
+                  placeholder="🤖"
+                />
               </div>
               <div class="flex-1">
                 <label class="mb-1 block text-xs font-semibold text-white/70">名称</label>
-                <input v-model="form.name" class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400" placeholder="例如：GPT战神" />
-                <label class="mb-1 mt-2 block text-xs font-semibold text-white/70">头像图片 URL（可选）</label>
-                <input v-model="form.avatar" class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400" placeholder="https://..." />
+                <input
+                  v-model="form.name"
+                  class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
+                  placeholder="例如：GPT战神"
+                />
+                <label class="mb-1 mt-2 block text-xs font-semibold text-white/70">
+                  头像图片 URL（可选）
+                </label>
+                <input
+                  v-model="form.avatar"
+                  class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
+                  placeholder="https://..."
+                />
               </div>
             </div>
 
             <div>
-              <label class="mb-1 block text-xs font-semibold text-white/70">接口地址 Base URL</label>
-              <input v-model="form.baseUrl" class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400" placeholder="https://api.deepseek.com/v1" />
+              <label class="mb-1 block text-xs font-semibold text-white/70">
+                接口地址 Base URL
+              </label>
+              <input
+                v-model="form.baseUrl"
+                class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
+                placeholder="https://api.deepseek.com/v1"
+              />
             </div>
             <div class="grid grid-cols-2 gap-3">
               <div>
                 <label class="mb-1 block text-xs font-semibold text-white/70">模型名称</label>
-                <input v-model="form.model" class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400" placeholder="deepseek-chat" />
+                <input
+                  v-model="form.model"
+                  class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
+                  placeholder="deepseek-chat"
+                />
               </div>
               <div>
                 <label class="mb-1 block text-xs font-semibold text-white/70">API Key</label>
-                <input v-model="form.apiKey" type="password" class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400" placeholder="sk-..." />
+                <input
+                  v-model="form.apiKey"
+                  type="password"
+                  class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
+                  placeholder="sk-..."
+                />
               </div>
             </div>
             <div class="grid grid-cols-2 gap-3">
               <div>
-                <label class="mb-1 flex items-center justify-between text-xs font-semibold text-white/70"><span>激进度</span><span class="text-rose-300">{{ Math.round(form.aggression * 100) }}%</span></label>
-                <input v-model.number="form.aggression" type="range" min="0" max="1" step="0.05" class="w-full accent-rose-400" />
+                <label
+                  class="mb-1 flex items-center justify-between text-xs font-semibold text-white/70"
+                >
+                  <span>激进度</span>
+                  <span class="text-rose-300">{{ Math.round(form.aggression * 100) }}%</span>
+                </label>
+                <input
+                  v-model.number="form.aggression"
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  class="w-full accent-rose-400"
+                />
               </div>
               <div>
-                <label class="mb-1 flex items-center justify-between text-xs font-semibold text-white/70"><span>紧度</span><span class="text-sky-300">{{ Math.round(form.tightness * 100) }}%</span></label>
-                <input v-model.number="form.tightness" type="range" min="0" max="1" step="0.05" class="w-full accent-sky-400" />
+                <label
+                  class="mb-1 flex items-center justify-between text-xs font-semibold text-white/70"
+                >
+                  <span>紧度</span>
+                  <span class="text-sky-300">{{ Math.round(form.tightness * 100) }}%</span>
+                </label>
+                <input
+                  v-model.number="form.tightness"
+                  type="range"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  class="w-full accent-sky-400"
+                />
               </div>
             </div>
 
-            <div v-if="formError" class="rounded-lg bg-rose-500/20 px-3 py-2 text-xs text-rose-200">{{ formError }}</div>
+            <div v-if="formError" class="rounded-lg bg-rose-500/20 px-3 py-2 text-xs text-rose-200">
+              {{ formError }}
+            </div>
           </div>
 
           <div class="mt-5 flex justify-end gap-3">
-            <button class="btn-ghost rounded-xl px-5 py-2 text-sm" :disabled="saving" @click="showModal = false">取消</button>
-            <button class="btn btn-primary px-6 py-2 text-sm" :disabled="saving" @click="saveCustom">
+            <button
+              class="btn-ghost rounded-xl px-5 py-2 text-sm"
+              :disabled="saving"
+              @click="showModal = false"
+            >
+              取消
+            </button>
+            <button
+              class="btn btn-primary px-6 py-2 text-sm"
+              :disabled="saving"
+              @click="saveCustom"
+            >
               {{ saving ? "检测中…" : "保存并添加" }}
             </button>
           </div>
@@ -379,75 +482,7 @@ async function saveCustom() {
       </div>
     </transition>
 
-    <!-- 修改模型配置弹窗 -->
-    <transition name="ball">
-      <div
-        v-if="showEdit && editTarget"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
-        @click.self="showEdit = false"
-      >
-        <div class="w-[460px] max-w-full rounded-3xl border border-white/15 bg-gradient-to-b from-slate-800 to-slate-900 p-6 shadow-2xl">
-          <div class="mb-1 text-xl font-black text-amber-100">⚙️ 修改模型配置</div>
-          <div class="mb-4 text-xs text-white/55">
-            {{ editTarget.name }}（{{ editIsCustom ? "自定义模型" : "内置 agent" }}）· 留空的项将回落到「设置」里的全局配置
-          </div>
-
-          <div class="space-y-3">
-            <div>
-              <label class="mb-1 block text-xs font-semibold text-white/70">接口地址 Base URL</label>
-              <input
-                v-model="editForm.baseUrl"
-                class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
-                :placeholder="'留空使用全局地址（' + store.settings.baseUrl + '）'"
-              />
-            </div>
-            <div class="grid grid-cols-2 gap-3">
-              <div>
-                <label class="mb-1 block text-xs font-semibold text-white/70">模型名称</label>
-                <input
-                  v-model="editForm.model"
-                  class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
-                  placeholder="如 deepseek-chat"
-                />
-              </div>
-              <div>
-                <label class="mb-1 block text-xs font-semibold text-white/70">API Key</label>
-                <input
-                  v-model="editForm.apiKey"
-                  type="password"
-                  class="w-full rounded-lg border border-white/15 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-amber-400"
-                  placeholder="留空使用全局 Key"
-                />
-              </div>
-            </div>
-
-            <div
-              v-if="editError"
-              class="rounded-lg px-3 py-2 text-xs"
-              :class="editTesting ? 'bg-sky-500/20 text-sky-200' : 'bg-rose-500/20 text-rose-200'"
-            >
-              {{ editError }}
-            </div>
-          </div>
-
-          <div class="mt-5 flex items-center justify-between gap-3">
-            <button
-              v-if="!editIsCustom && editHasOverride"
-              class="btn-ghost rounded-xl px-4 py-2 text-xs"
-              @click="resetOverride"
-            >
-              ↺ 恢复默认配置
-            </button>
-            <span v-else></span>
-            <div class="flex gap-3">
-              <button class="btn-ghost rounded-xl px-5 py-2 text-sm" :disabled="editTesting" @click="showEdit = false">取消</button>
-              <button class="btn btn-primary px-6 py-2 text-sm" :disabled="editTesting" @click="saveEdit">
-                {{ editTesting ? "检测中…" : "检测并保存" }}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </transition>
+    <!-- 修改模型配置弹窗（共享组件 AgentModelEditor，牌桌页面也复用同一个弹窗） -->
+    <AgentModelEditor :open="showEdit" :agent-id="editId" @close="showEdit = false" />
   </div>
 </template>

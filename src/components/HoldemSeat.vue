@@ -11,7 +11,11 @@ const props = defineProps<{
   reveal: boolean; // 摊牌时亮牌
   winner: boolean;
   compact?: boolean; // 人数多时缩小
+  // 该 agent 对应大模型的连通状态（启用大模型时才传）
+  conn?: { ok: boolean; model: string; error?: string; checking?: boolean };
 }>();
+
+const emit = defineEmits<{ (e: "editModel"): void }>();
 
 const isHuman = computed(() => props.player.isHuman);
 const showHole = computed(() => isHuman.value || props.reveal);
@@ -93,6 +97,19 @@ const busted = computed(() => props.player.isBusted);
         <div v-else-if="busted" class="mt-0.5 text-[10px] text-rose-200/80">出局</div>
       </div>
     </div>
+
+    <!-- 模型在线状态（点击可修改该 agent 的模型配置） -->
+    <button
+      v-if="conn"
+      class="flex max-w-full items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-bold shadow transition-colors"
+      :class="conn.ok ? 'bg-emerald-500/25 text-emerald-200 hover:bg-emerald-500/40' : 'bg-rose-500/25 text-rose-200 hover:bg-rose-500/40'"
+      :title="conn.ok ? '点击修改该 agent 的模型配置' : (conn.error || '连接失败') + '（点击修改配置）'"
+      @click="emit('editModel')"
+    >
+      <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="conn.ok ? 'bg-emerald-400' : 'bg-rose-400'"></span>
+      <span class="truncate">{{ conn.model }}</span>
+      <span>{{ conn.checking ? "检测中…" : conn.ok ? "在线" : "不在线" }}</span>
+    </button>
 
     <!-- 手牌 -->
     <div class="flex h-[5.1rem] items-end justify-center">
