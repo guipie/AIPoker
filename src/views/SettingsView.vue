@@ -195,7 +195,25 @@ async function save() {
         </div>
       </div>
 
-      <p class="mt-4 text-center text-[11px] text-amber-100/30">
+      <!-- 本地数据存储：桌面端为 SQLite，浏览器预览为 localStorage -->
+      <div class="mt-4 flex flex-wrap items-center justify-center gap-2 text-[11px]">
+        <span class="text-amber-100/40">本地数据存储</span>
+        <span
+          class="rounded px-2 py-0.5 font-medium"
+          :class="
+            store.storage.kind === 'sqlite'
+              ? 'bg-emerald-500/20 text-emerald-200'
+              : 'bg-white/10 text-white/60'
+          "
+        >
+          {{ store.storage.label }}
+        </span>
+        <span v-if="store.storage.error" class="text-rose-300">
+          （切换失败：{{ store.storage.error }}）
+        </span>
+      </div>
+
+      <p class="mt-3 text-center text-[11px] text-amber-100/30">
         提示：启用大模型或填写了 API Key 后，保存前会自动校验 Key 是否正确，校验失败将无法保存。
         <br />
         每个 Agent 可在「Agent 广场」单独指定模型与人设，覆盖这里的全局设置。

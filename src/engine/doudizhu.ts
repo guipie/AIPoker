@@ -9,6 +9,7 @@ import {
   shuffle,
   sortDdzCards,
 } from "./cards";
+import { GameEngine } from "./GameEngine";
 
 export type DdzRole = "landlord" | "farmer";
 
@@ -597,7 +598,7 @@ export function findAllBeats(hand: Card[], last: CardPattern | null): Card[][] {
 
 // ===================== 游戏主体 =====================
 
-export class DoudizhuGame {
+export class DoudizhuGame extends GameEngine<DdzState, DdzAction> {
   private players: DdzPlayer[] = [];
   private landlordCards: Card[] = [];
   private phase: DdzPhase = "bidding";
@@ -612,10 +613,11 @@ export class DoudizhuGame {
   private bidPtr = 0;
   private redealCount = 0;
   private message = "";
-  private actions: DdzAction[] = [];
+  // 动作流水由基类 GameEngine 维护（actions / actionCount / recentActions）
   private played: Card[] = [];
 
   constructor(names: string[], humanName = "你", noJokers = false) {
+    super();
     // names 为机器人名字列表；人类固定为 0 号并置于最前，
     // 这样传入 2 个名字即得到「你 + 2 个机器人」共 3 人，符合“默认 2 个 agent，3~4 人”的设计。
     this.players = [
@@ -656,7 +658,7 @@ export class DoudizhuGame {
     this.lastPlayerId = null;
     this.passCount = 0;
     this.winner = null;
-    this.actions = [];
+    this.resetActions();
     this.played = [];
     // 随机先叫，按人数生成叫分顺序
     const first = Math.floor(Math.random() * this.players.length);
@@ -799,9 +801,9 @@ export class DoudizhuGame {
       biddingOrder: [...this.biddingOrder],
       bidPtr: this.bidPtr,
       redealCount: this.redealCount,
-      recentActions: this.actions.slice(-8).map((a) => ({ ...a, cards: a.cards ? [...a.cards] : null })),
+      recentActions: this.recentActions(8).map((a) => ({ ...a, cards: a.cards ? [...a.cards] : null })),
       playedCards: [...this.played],
-      actionCount: this.actions.length,
+      actionCount: this.actionCount,
     };
   }
 }

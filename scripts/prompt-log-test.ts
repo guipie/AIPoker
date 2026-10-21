@@ -4,12 +4,7 @@ import { createServer } from "node:http";
 import { DoudizhuGame } from "../src/engine/doudizhu";
 import { llmDdzBid, llmDdzDecision, type LlmConfig } from "../src/engine/llm";
 import { doudizuRules, qiangDoudizuRules } from "../src/utils/prompts";
-import {
-  loadMatchLogs,
-  saveMatchLogs,
-  MAX_MATCH_LOGS,
-  type MatchLog,
-} from "../src/utils/matchLog";
+import { MATCH_LOG_LIMIT_JSON, type MatchLog } from "../src/types/match";
 import { addMatchLog, matchLogById, recordResult, store } from "../src/store";
 import { shouldUseLlm } from "../src/utils/llmCheck";
 
@@ -173,16 +168,15 @@ assert(store.matchLogs.length === before + 1, "addMatchLog 后内存里能查到
 assert(matchLogById("ddz-1")?.detail.kind === "ddz", "matchLogById 能按 id 取到明细");
 assert(matchLogById("不存在") === null, "查不到的 id 返回 null");
 
-const saved = loadMatchLogs();
-assert(saved.length >= 1 && saved[0].id === "ddz-1", "日志已写入 localStorage 并可读回");
-
-// 条数保护
-saveMatchLogs(Array.from({ length: MAX_MATCH_LOGS + 12 }, (_, i) => mkLog(100 + i)));
-assert(loadMatchLogs().length === MAX_MATCH_LOGS, `日志最多保留 ${MAX_MATCH_LOGS} 局`);
+// 条数保护：镜像写入超过容量时只保留最新的 capacity 条
+const cap = MATCH_LOG_LIMIT_JSON;
+for (let i = 0; i < cap + 12; i++) addMatchLog(mkLog(100 + i));
+assert(store.matchLogs.length === cap, `日志最多保留 ${cap} 局`);
+assert(store.matchLogs[0].id.includes(String(100 + cap + 11)), "超容量后最新的一局仍在");
 
 // 战绩记录挂 logId
 const handsBefore = store.stats.hands.length;
-recordResult("ddz", true, "测试", "ddz-1");
+recordResult("doudizhu", true, "测试", "ddz-1");
 assert(store.stats.hands[0].logId === "ddz-1", "战绩记录里带有 logId，可反查明细");
 assert(store.stats.hands.length === handsBefore + 1, "战绩记录数量 +1");
 

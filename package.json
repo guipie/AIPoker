@@ -10,11 +10,12 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^1.6.0",
+    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/plugin-sql": "^2.6.0",
     "vue": "^3.5.13"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^1.6.0",
+    "@tauri-apps/cli": "^2.12.3",
     "@vitejs/plugin-vue": "^5.2.1",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.4.49",

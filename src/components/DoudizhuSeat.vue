@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from "vue";
 import type { DdzPlayer } from "../engine/doudizhu";
-import type { AgentDef } from "../store";
+import type { AgentDef } from "../types";
 import CardComp from "./Card.vue";
 
 const props = defineProps<{

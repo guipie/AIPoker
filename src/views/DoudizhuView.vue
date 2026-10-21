@@ -17,8 +17,9 @@ import {
 } from "../engine/doudizhu";
 import { llmDdzBid, llmDdzDecision, type LlmConfig } from "../engine/llm";
 import { addMatchLog, agentById, pickAgents, recordResult, store } from "../store";
-import { checkAgents, configForAgent, shouldUseLlm, type AgentConnResult } from "../utils/llmCheck";
-import { newLogId, type MatchLogEntry } from "../utils/matchLog";
+import { configForAgent, shouldUseLlm } from "../utils/llmCheck";
+import { useAgentConnection } from "../composables/useAgentConnection";
+import { newLogId, type MatchLogEntry } from "../types/match";
 
 const game = ref<DoudizhuGame | null>(null);
 const state = ref<any>(null);
@@ -27,10 +28,13 @@ const busy = ref(false);
 const thinkingId = ref<number | null>(null);
 const agentIds = ref<string[]>([]);
 
-// 开局前的大模型连通性检查
-const connChecking = ref(false);
-const connErrors = ref<AgentConnResult[]>([]);
-const lastList = ref<string[]>([]);
+// 开局前的大模型连通性检查（斗地主 / 德州共用同一套 composable）
+const conn = useAgentConnection();
+const connChecking = conn.checking;
+const connErrors = conn.errors;
+const agentOnline = conn.online;
+const lastList = conn.lastIds;
+const { markOffline, markOnline, recheckOne, connOf } = conn;
 
 let running = false;
 let paused = false;
@@ -256,7 +260,7 @@ function finalizeMatch(win: boolean) {
     entries: [...matchEntries.value],
   });
   lastLogId.value = id;
-  recordResult("ddz", win, text, id);
+  recordResult("doudizhu", win, text, id);
 }
 
 /** 结算弹层：跳到战绩页并直接打开本局复盘 */
@@ -292,38 +296,13 @@ function newGame(ids?: string[]) {
 /** 开局入口：启用大模型时先检查牌桌上所有 agent 的连接，全部通过才真正开局 */
 async function requestNewGame(ids?: string[]) {
   const list = ids && ids.length ? ids.slice(0, 3) : pickAgents(2);
-  lastList.value = list;
-  if (store.settings.enabled) {
-    connChecking.value = true;
-    connErrors.value = [];
-    const res = await checkAgents(list);
-    connChecking.value = false;
-    const bad = res.filter(r => !r.ok);
-    if (bad.length) {
-      connErrors.value = bad;
-      sfx.lose();
-      return; // 连接失败：不开始牌局
-    }
-    applyOnline(res); // 记录各 agent 的在线状态
-  } else {
-    // 未启用大模型：不做任何连通性判断，同时清掉上一次留下的错误遮罩
-    agentOnline.value = {};
-    connErrors.value = [];
+  const ok = await conn.checkBeforeStart(list);
+  if (!ok) {
+    sfx.lose();
+    return; // 连接失败：不开始牌局
   }
   newGame(list);
 }
-
-// 关闭大模型后，立刻清掉残留的“连接失败/去设置”提示（keep-alive 会保留下次仍是旧状态）
-watch(
-  () => store.settings.enabled,
-  on => {
-    if (!on) {
-      connErrors.value = [];
-      connChecking.value = false;
-      agentOnline.value = {};
-    }
-  }
-);
 
 // 加减机器人（重置发牌）
 function addBot() {
@@ -667,67 +646,17 @@ function goSettings() {
 }
 
 // ===== 牌桌上各 agent 的大模型在线状态 =====
-const agentOnline = ref<
-  Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }>
->({});
 const showEditor = ref(false);
 const editAgentId = ref<string | null>(null);
 
+/** 座位组件用：座位号 → 该 agent 的连接状态 */
 function connFor(id: number) {
-  const aid = agentMap.value[id];
-  return aid ? agentOnline.value[aid] : undefined;
+  return connOf(agentMap.value[id]);
 }
 
-function applyOnline(res: AgentConnResult[]) {
-  const map: Record<string, { ok: boolean; model: string; error?: string; checking?: boolean }> =
-    {};
-  for (const r of res) {
-    const a = agentById(r.id);
-    map[r.id] = { ok: r.ok, model: a?.model ?? store.settings.model, error: r.error };
-  }
-  agentOnline.value = map;
-}
-
-/** 重新检测牌桌上所有 agent（不阻断牌局，仅更新状态徽章） */
-async function recheckAgents() {
-  const ids = agentIds.value;
-  if (!store.settings.enabled || !ids.length) {
-    agentOnline.value = {};
-    return;
-  }
-  applyOnline(await checkAgents(ids));
-}
-
-/** 某个 agent 的模型配置被修改后，单独重检它 */
-async function recheckOne(id: string) {
-  const model = agentById(id)?.model ?? store.settings.model;
-  agentOnline.value = { ...agentOnline.value, [id]: { ok: false, model, checking: true } };
-  const res = await checkAgents([id]);
-  const r = res[0];
-  if (r) {
-    agentOnline.value = {
-      ...agentOnline.value,
-      [id]: { ok: r.ok, model: agentById(id)?.model ?? store.settings.model, error: r.error },
-    };
-  }
-}
-
-/** 运行时调用大模型失败 → 把该 agent 标记为不在线，并显示服务端原因 */
-function markOffline(id: string, msg: string) {
-  agentOnline.value = {
-    ...agentOnline.value,
-    [id]: { ok: false, model: agentById(id)?.model ?? store.settings.model, error: msg },
-  };
-}
-
-/** 调用成功 → 若之前被标记为不在线，恢复为在线 */
-function markOnline(id: string) {
-  const prev = agentOnline.value[id];
-  if (!prev || prev.ok) return;
-  agentOnline.value = {
-    ...agentOnline.value,
-    [id]: { ok: true, model: agentById(id)?.model ?? store.settings.model },
-  };
+/** 顶栏 ⟳：重检牌桌上所有 agent（不阻断牌局） */
+function recheckAgents() {
+  return conn.recheckAll(agentIds.value);
 }
 
 function openModelEditor(id: number) {

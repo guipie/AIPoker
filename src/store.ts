@@ -1,156 +1,46 @@
-// 中央状态：视图路由、LLM 设置、AI 对手档案库、默认/自定义 agent、牌桌选座、战绩统计、对局日志。
+/**
+ * 中央状态：视图路由、LLM 设置、AI 对手档案、选座、战绩、对局明细。
+ *
+ * 分层（自上而下单向依赖，避免循环）：
+ *   视图 / 组件 → store（本文件）→ Repository → Persistence（SQLite / localStorage / 内存）
+ *
+ * 本文件不再直接触碰任何存储介质：所有读写都走 `src/storage/`，
+ * 于是「桌面端存 SQLite、浏览器存 localStorage」对业务代码完全透明。
+ */
 import { reactive } from "vue";
+import { AGENTS } from "./data/agents";
+import type { DriverKind } from "./storage/BasePersistence";
+import { initPersistence, persistenceStatus, type Persistence } from "./storage";
+import { MemoryPersistence } from "./storage/MemoryPersistence";
 import {
-  loadMatchLogs,
-  saveMatchLogs,
-  type MatchLog,
-} from "./utils/matchLog";
+  AgentsRepository,
+  SettingsRepository,
+  StatsRepository,
+} from "./storage/Repository";
+import { createMatchLogStore, type MatchLogQuery, type MatchLogStore } from "./storage/MatchLogStore";
+import type {
+  AgentDef,
+  AgentModelOverride,
+  GameMode,
+  LastResult,
+  LlmSettings,
+  Stats,
+  ViewKey,
+} from "./types";
+import type { MatchLog, MatchLogEntry } from "./types/match";
 
-export type ViewKey = "plaza" | "doudizhu" | "holdem" | "agents" | "stats" | "settings";
-export type GameMode = "doudizhu" | "holdem";
+// 类型再导出：视图可从 store 或 types 取，保持旧 import 路径可用
+export type {
+  AgentDef,
+  AgentModelOverride,
+  GameMode,
+  LlmSettings,
+  Stats,
+  ViewKey,
+} from "./types";
+export type { MatchLog, MatchLogEntry } from "./types/match";
 
-export interface LlmSettings {
-  enabled: boolean;
-  baseUrl: string;
-  model: string;
-  apiKey: string;
-  persona: string;
-  temperature: number;
-  sound: boolean;
-}
-
-export interface AgentDef {
-  id: string;
-  name: string;
-  emoji: string; // 头像 emoji（无图片时回退用）
-  avatar?: string; // 可选图片 URL
-  color: string; // 主题色（tailwind 渐变两端）
-  color2: string;
-  tagline: string;
-  aggression: number; // 0~1
-  tightness: number; // 0~1
-  model?: string; // 可选：覆盖全局模型（不同 agent 用不同大模型）
-  baseUrl?: string; // 自定义大模型的接口地址
-  apiKey?: string; // 自定义大模型的 key
-  persona?: string; // 可选：独立人设
-  blurb: string;
-  isCustom?: boolean; // 用户自定义
-}
-
-// ===================== AI 对手档案库（agent 广场） =====================
-export const AGENTS: AgentDef[] = [
-  {
-    id: "qiang",
-    name: "狂刀阿强",
-    emoji: "🤠",
-    color: "from-rose-500",
-    color2: "to-red-700",
-    tagline: "激进诈唬流",
-    aggression: 0.88,
-    tightness: 0.35,
-    model: "deepseek-flash",
-    persona: "激进好斗，喜欢加注和诈唬，口头禅「跟到底」",
-    blurb: "永远在施压，能逼出你的破绽，也常在自己诈唬时翻车。",
-  },
-  {
-    id: "mou",
-    name: "老谋子",
-    emoji: "🧠",
-    color: "from-sky-500",
-    color2: "to-blue-800",
-    tagline: "保守计算型",
-    aggression: 0.22,
-    tightness: 0.85,
-    model: "gpt-4o-mini",
-    persona: "冷静理性，只玩强牌，擅长读牌与赔率计算",
-    blurb: "稳如磐石，轻易不参战，一旦下注往往牌力不俗。",
-  },
-  {
-    id: "gambit",
-    name: "赌神G",
-    emoji: "😎",
-    color: "from-violet-500",
-    color2: "to-fuchsia-700",
-    tagline: "均衡职业选手",
-    aggression: 0.55,
-    tightness: 0.55,
-    model: "moonshot-v1-8k",
-    persona: "风格均衡的职业牌手，攻守兼备",
-    blurb: "没有明显短板，会利用位置与下注尺度拿价值。",
-  },
-  {
-    id: "fox",
-    name: "小狐狸",
-    emoji: "🦊",
-    color: "from-orange-400",
-    color2: "to-amber-600",
-    tagline: "松凶诈唬怪",
-    aggression: 0.92,
-    tightness: 0.28,
-    model: "qwen2.5:7b",
-    persona: "机灵爱诈唬的狐狸，常常用空气牌吓人",
-    blurb: "出手频率极高，诈唬多到你难以判断真假。",
-  },
-  {
-    id: "tie",
-    name: "铁柱哥",
-    emoji: "🪨",
-    color: "from-slate-400",
-    color2: "to-slate-700",
-    tagline: "紧弱跟注站",
-    aggression: 0.18,
-    tightness: 0.82,
-    persona: "老实巴交的跟注站，轻易不弃牌也不加注",
-    blurb: "像块石头，只会用真牌跟注，别想诈唬他。",
-  },
-  {
-    id: "bolt",
-    name: "闪电",
-    emoji: "⚡",
-    color: "from-yellow-400",
-    color2: "to-amber-600",
-    tagline: "快攻猛打",
-    aggression: 0.8,
-    tightness: 0.5,
-    model: "deepseek-flash",
-    persona: "节奏极快的进攻型选手，喜欢快速施压",
-    blurb: "出手又快又狠，给你思考的时间很少。",
-  },
-  {
-    id: "pro",
-    name: "教授",
-    emoji: "🎓",
-    color: "from-emerald-500",
-    color2: "to-teal-700",
-    tagline: "GTO 理论派",
-    aggression: 0.5,
-    tightness: 0.62,
-    model: "gpt-4o",
-    persona: "严谨遵循博弈论最优策略（GTO）的理论派",
-    blurb: "数学碾压型对手，漏洞极少，长期必赢。",
-  },
-  {
-    id: "rookie",
-    name: "萌新小白",
-    emoji: "🐣",
-    color: "from-pink-400",
-    color2: "to-rose-500",
-    tagline: "新手练习对象",
-    aggression: 0.45,
-    tightness: 0.4,
-    persona: "刚学会扑克的新手，偶尔犯迷糊",
-    blurb: "手感飘忽的新人，适合练手找信心。",
-  },
-];
-
-// ===================== 持久化 =====================
-const SETTINGS_KEY = "puke.settings.v2";
-const STATS_KEY = "puke.stats.v2";
-const CUSTOM_KEY = "puke.customAgents.v1";
-const DEFAULTS_KEY = "puke.defaultAgentIds.v1";
-const OVERRIDES_KEY = "puke.agentOverrides.v1";
-
-const defaultSettings: LlmSettings = {
+const DEFAULT_SETTINGS: LlmSettings = {
   enabled: false,
   baseUrl: "https://api.deepseek.com/v1",
   model: "deepseek-flash",
@@ -160,130 +50,105 @@ const defaultSettings: LlmSettings = {
   sound: true,
 };
 
-function loadSettings(): LlmSettings {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...defaultSettings, ...JSON.parse(raw) };
-  } catch {
-    /* ignore */
-  }
-  return { ...defaultSettings };
-}
-
-function loadCustom(): AgentDef[] {
-  try {
-    const raw = localStorage.getItem(CUSTOM_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {
-    /* ignore */
-  }
-  return [];
-}
-
-function loadDefaultIds(): string[] {
-  try {
-    const raw = localStorage.getItem(DEFAULTS_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {
-    /* ignore */
-  }
-  return [];
-}
-
-/** agent 的模型配置覆盖（内置 agent 也可改用别的大模型） */
-export interface AgentModelOverride {
-  baseUrl?: string;
-  apiKey?: string;
-  model?: string;
-}
-
-function loadOverrides(): Record<string, AgentModelOverride> {
-  try {
-    const raw = localStorage.getItem(OVERRIDES_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {
-    /* ignore */
-  }
-  return {};
-}
-
-export interface Stats {
-  ddz: { win: number; lose: number };
-  holdem: { win: number; lose: number };
-  hands: { mode: string; result: string; time: number; logId?: string }[];
-}
-
-function loadStats(): Stats {
-  try {
-    const raw = localStorage.getItem(STATS_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch {
-    /* ignore */
-  }
-  return { ddz: { win: 0, lose: 0 }, holdem: { win: 0, lose: 0 }, hands: [] };
+function defaultStats(): Stats {
+  return {
+    doudizhu: { win: 0, lose: 0 },
+    holdem: { win: 0, lose: 0 },
+    hands: [],
+  };
 }
 
 export const store = reactive({
   view: "plaza" as ViewKey,
-  settings: loadSettings(),
+  settings: { ...DEFAULT_SETTINGS },
   selectedAgentIds: [] as string[], // Agent 广场多选（用于开始按钮）
-  defaultAgentIds: loadDefaultIds(), // 设为「默认」的 agent（开局优先）
-  customAgents: loadCustom(), // 用户自定义大模型 agent
-  agentOverrides: loadOverrides(), // 内置/自定义 agent 的模型配置覆盖（model/baseUrl/apiKey）
+  defaultAgentIds: [] as string[], // 设为「默认」的 agent（开局优先）
+  customAgents: [] as AgentDef[], // 用户自定义大模型 agent
+  agentOverrides: {} as Record<string, AgentModelOverride>, // agent 的模型配置覆盖
   startAgents: null as string[] | null, // 从广场开局时指定的对手列表
-  pendingNewGame: null as GameMode | null, // 标记进入视图后需开新局
-  pendingStatLogId: null as string | null, // 结算后「查看本局明细」：跳到战绩页自动打开这一局
-  activeGame: null as GameMode | null, // 当前进行中的牌局（用于悬浮圆球）
-  stats: loadStats(),
-  matchLogs: loadMatchLogs(), // 每局详细过程（抢地主 / 出牌 / 摊牌），供战绩页复盘
-  lastResult: null as null | { mode: string; win: boolean; text: string },
+  pendingNewGame: null as GameMode | null, // 进入视图后需开新局
+  pendingStatLogId: null as string | null, // 结算后「查看本局明细」自动打开这一局
+  activeGame: null as GameMode | null, // 当前进行中的牌局（悬浮圆球）
+  stats: defaultStats(),
+  matchLogs: [] as MatchLog[], // 每局明细（镜像，供战绩页复盘）
+  lastResult: null as LastResult | null,
+  /** 当前实际使用的存储介质（设置页展示） */
+  storage: {
+    kind: "memory" as DriverKind,
+    label: "初始化中…",
+    ready: false,
+    error: null as string | null,
+  },
 });
 
-// ===================== 持久化工具 =====================
-export function saveSettings() {
+// ===================== 持久化装配 =====================
+// 先挂一套内存实现，保证 bootstrap 之前调用也不会崩；bootstrap 后会被真实驱动替换。
+let backend: Persistence = new MemoryPersistence();
+let settingsRepo = new SettingsRepository(backend);
+let statsRepo = new StatsRepository(backend);
+let agentsRepo = new AgentsRepository(backend);
+let logStore: MatchLogStore = createMatchLogStore(backend);
+
+/**
+ * 启动装配：打开持久化 → 建 Repository → 把数据灌进 store。
+ * 在 main.ts 里 mount 之前 await，避免首屏读到默认值再闪一下。
+ */
+export async function bootstrapStore(): Promise<void> {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(store.settings));
-  } catch {
-    /* ignore */
-  }
-}
-export function saveStats() {
-  try {
-    localStorage.setItem(STATS_KEY, JSON.stringify(store.stats));
-  } catch {
-    /* ignore */
-  }
-}
-function saveCustom() {
-  try {
-    localStorage.setItem(CUSTOM_KEY, JSON.stringify(store.customAgents));
-  } catch {
-    /* ignore */
-  }
-}
-function saveDefaultIds() {
-  try {
-    localStorage.setItem(DEFAULTS_KEY, JSON.stringify(store.defaultAgentIds));
-  } catch {
-    /* ignore */
-  }
-}
-function saveOverrides() {
-  try {
-    localStorage.setItem(OVERRIDES_KEY, JSON.stringify(store.agentOverrides));
-  } catch {
-    /* ignore */
+    backend = await initPersistence();
+    settingsRepo = new SettingsRepository(backend);
+    statsRepo = new StatsRepository(backend);
+    agentsRepo = new AgentsRepository(backend);
+    logStore = createMatchLogStore(backend);
+
+    store.settings = settingsRepo.load();
+    store.stats = statsRepo.load();
+    store.customAgents = agentsRepo.custom.load();
+    store.agentOverrides = agentsRepo.overrides.load();
+    store.defaultAgentIds = agentsRepo.defaultIds.load();
+    store.matchLogs = await logStore.load();
+
+    const st = persistenceStatus();
+    store.storage.kind = st?.kind ?? "memory";
+    store.storage.label = st?.label ?? "内存（临时）";
+    store.storage.ready = true;
+  } catch (e) {
+    store.storage.error = e instanceof Error ? e.message : String(e);
+    store.storage.ready = true; // 出错也要让 UI 起来，只是不落盘
   }
 }
 
-/** 保存某个 agent 的模型配置覆盖（baseUrl/model/apiKey；字段未提供=保持不变，空串=清除该项回落默认） */
-export function saveAgentOverride(id: string, patch: AgentModelOverride) {
+// ===================== 持久化入口（写操作：内存即时 + 异步落盘） =====================
+export function saveSettings(): void {
+  settingsRepo.save(store.settings);
+}
+export function saveStats(): void {
+  statsRepo.save(store.stats);
+}
+function saveCustom(): void {
+  agentsRepo.custom.save(store.customAgents);
+}
+function saveDefaultIds(): void {
+  agentsRepo.defaultIds.save(store.defaultAgentIds);
+}
+function saveOverrides(): void {
+  agentsRepo.overrides.save(store.agentOverrides);
+}
+
+/** 手动把所有改动刷到介质（如退出前调用） */
+export function flushStorage(): Promise<void> {
+  return backend.flush();
+}
+
+// ===================== Agent =====================
+/** 保存某个 agent 的模型配置覆盖（未提供=不动，空串=清除该项回落默认） */
+export function saveAgentOverride(id: string, patch: AgentModelOverride): void {
   const cur: AgentModelOverride = { ...(store.agentOverrides[id] ?? {}) };
   for (const k of ["baseUrl", "apiKey", "model"] as const) {
-    if (patch[k] === undefined) continue; // 未提供该字段 → 不动
-    const v = patch[k].trim();
+    if (patch[k] === undefined) continue;
+    const v = (patch[k] ?? "").trim();
     if (v) cur[k] = v;
-    else delete cur[k]; // 显式传空串 = 清除覆盖
+    else delete cur[k];
   }
   if (Object.keys(cur).length === 0) delete store.agentOverrides[id];
   else store.agentOverrides[id] = cur;
@@ -291,14 +156,14 @@ export function saveAgentOverride(id: string, patch: AgentModelOverride) {
 }
 
 /** 清除某个 agent 的全部模型配置覆盖（恢复默认） */
-export function clearAgentOverride(id: string) {
+export function clearAgentOverride(id: string): void {
   delete store.agentOverrides[id];
   saveOverrides();
 }
 
 /** 直接修改自定义 agent 的模型配置（写回 customAgents 并持久化） */
-export function updateCustomAgent(id: string, patch: AgentModelOverride) {
-  const a = store.customAgents.find(c => c.id === id);
+export function updateCustomAgent(id: string, patch: AgentModelOverride): void {
+  const a = store.customAgents.find((c) => c.id === id);
   if (!a) return;
   if (patch.baseUrl !== undefined) a.baseUrl = patch.baseUrl.trim() || undefined;
   if (patch.apiKey !== undefined) a.apiKey = patch.apiKey.trim() || undefined;
@@ -306,18 +171,16 @@ export function updateCustomAgent(id: string, patch: AgentModelOverride) {
   saveCustom();
 }
 
-// ===================== Agent 查询 =====================
+/** 全部 agent（内置 + 自定义），已合并模型配置覆盖 */
 export function allAgents(): AgentDef[] {
-  // 合并模型配置覆盖，使内置 agent 也能用用户指定的 baseUrl/apiKey/model
-  const merged = [...AGENTS, ...store.customAgents].map(a => {
+  return [...AGENTS, ...store.customAgents].map((a) => {
     const o = store.agentOverrides[a.id];
     return o ? { ...a, ...o } : a;
   });
-  return merged;
 }
 
 export function agentById(id: string): AgentDef | undefined {
-  return allAgents().find(a => a.id === id);
+  return allAgents().find((a) => a.id === id);
 }
 
 export function isDefault(id: string): boolean {
@@ -325,7 +188,7 @@ export function isDefault(id: string): boolean {
 }
 
 /** 切换某个 agent 的「默认」状态（开局优先显示） */
-export function toggleDefault(id: string) {
+export function toggleDefault(id: string): void {
   const i = store.defaultAgentIds.indexOf(id);
   if (i >= 0) store.defaultAgentIds.splice(i, 1);
   else store.defaultAgentIds.push(id);
@@ -333,7 +196,7 @@ export function toggleDefault(id: string) {
 }
 
 /** 新增自定义 agent（持久化） */
-export function addCustomAgent(a: AgentDef) {
+export function addCustomAgent(a: AgentDef): void {
   store.customAgents.push(a);
   saveCustom();
 }
@@ -348,48 +211,45 @@ function shuffleStr(arr: string[]): string[] {
 }
 
 /**
- * 挑选 count 个对手 id：优先使用「默认」agent（按默认顺序），
- * 不足再从剩余池随机补足；exclude 内的 id 会被跳过。
- * 没有默认 agent 时完全随机。
+ * 挑选 count 个对手 id：优先「默认」agent，不足再从剩余池随机补足；
+ * exclude 内的 id 会被跳过。
  */
 export function pickAgents(count: number, exclude: string[] = []): string[] {
   const pool = allAgents()
-    .map(a => a.id)
-    .filter(id => !exclude.includes(id));
-  const defs = store.defaultAgentIds.filter(id => pool.includes(id));
-  const rest = shuffleStr(pool.filter(id => !defs.includes(id)));
+    .map((a) => a.id)
+    .filter((id) => !exclude.includes(id));
+  const defs = store.defaultAgentIds.filter((id) => pool.includes(id));
+  const rest = shuffleStr(pool.filter((id) => !defs.includes(id)));
   return [...defs, ...rest].slice(0, count);
 }
 
 /** 从广场/首页发起一局：记录对手列表并切到对应视图 */
-export function beginGame(mode: GameMode, agents?: string[]) {
+export function beginGame(mode: GameMode, agents?: string[]): void {
   store.startAgents = agents && agents.length ? [...agents] : null;
   store.pendingNewGame = mode;
   store.activeGame = mode;
   store.view = mode;
 }
 
-export function recordResult(
-  mode: "ddz" | "holdem",
-  win: boolean,
-  text: string,
-  logId?: string,
-) {
-  if (win) store.stats[mode].win++;
-  else store.stats[mode].lose++;
+// ===================== 战绩 =====================
+export function recordResult(mode: GameMode, win: boolean, text: string, logId?: string): void {
+  const bucket = store.stats[mode];
+  if (win) bucket.win += 1;
+  else bucket.lose += 1;
   store.stats.hands.unshift({ mode, result: win ? "胜" : "负", time: Date.now(), logId });
-  if (store.stats.hands.length > 50) store.stats.hands.pop();
+  if (store.stats.hands.length > StatsRepository.MAX_HANDS) store.stats.hands.pop();
   store.lastResult = { mode, win, text };
   saveStats();
 }
 
-// ===================== 对局日志（明细复盘） =====================
+// ===================== 对局明细 =====================
 
-/** 追加一局明细（最新的在最前），并做条数/体积保护 */
-export function addMatchLog(log: MatchLog) {
+/** 追加一局明细（镜像即时更新 + 异步落盘） */
+export function addMatchLog(log: MatchLog): void {
+  const cap = logStore.capacity;
   store.matchLogs.unshift(log);
-  if (store.matchLogs.length > 30) store.matchLogs.splice(30);
-  saveMatchLogs(store.matchLogs);
+  if (store.matchLogs.length > cap) store.matchLogs.length = cap;
+  void logStore.save(log).catch(() => undefined);
 }
 
 export function matchLogById(id: string | undefined | null): MatchLog | null {
@@ -397,7 +257,18 @@ export function matchLogById(id: string | undefined | null): MatchLog | null {
   return store.matchLogs.find((l) => l.id === id) ?? null;
 }
 
-export function clearMatchLogs() {
+/** 条件查询（桌面端走 SQL，浏览器走内存过滤——多态） */
+export function searchMatchLogs(q: MatchLogQuery = {}): Promise<MatchLog[]> {
+  return logStore.query(q);
+}
+
+export async function removeMatchLog(id: string): Promise<void> {
+  const i = store.matchLogs.findIndex((l) => l.id === id);
+  if (i >= 0) store.matchLogs.splice(i, 1);
+  await logStore.remove(id);
+}
+
+export async function clearMatchLogs(): Promise<void> {
   store.matchLogs.splice(0);
-  saveMatchLogs([]);
+  await logStore.clear();
 }

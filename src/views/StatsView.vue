@@ -2,9 +2,9 @@
 import { computed, onActivated, onMounted, ref } from "vue";
 import { clearMatchLogs, matchLogById, store } from "../store";
 import { sfx } from "../audio/sfx";
-import type { DdzDetail, HoldemDetail, MatchLog, MatchLogEntry } from "../utils/matchLog";
+import type { DdzDetail, HoldemDetail, MatchLog, MatchLogEntry } from "../types/match";
 
-const ddz = computed(() => store.stats.ddz);
+const ddz = computed(() => store.stats.doudizhu);
 const holdem = computed(() => store.stats.holdem);
 const total = computed(() => ddz.value.win + ddz.value.lose + holdem.value.win + holdem.value.lose);
 const winRate = (w: number, l: number) => (w + l === 0 ? "—" : Math.round((w / (w + l)) * 100) + "%");
@@ -169,7 +169,7 @@ onActivated(consumePending);
             @click="openDetail(h.logId)"
           >
             <span class="flex items-center gap-2 text-white/80">
-              <span>{{ h.mode === "ddz" ? "🃏 斗地主" : "♠ 德州扑克" }}</span>
+              <span>{{ h.mode === "doudizhu" ? "🃏 斗地主" : "♠ 德州扑克" }}</span>
               <span v-if="h.logId" class="rounded bg-amber-400/15 px-1.5 py-0.5 text-[10px] text-amber-200">明细 ›</span>
             </span>
             <span class="flex items-center gap-3">

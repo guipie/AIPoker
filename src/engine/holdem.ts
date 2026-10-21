@@ -2,6 +2,7 @@
 // 支持 2~6 人（1 人类 + 多机器人），盲注、下注轮次、公共牌、摊牌、边池与规则 AI。
 
 import { Card, makeStdDeck, shuffle, sortStdCards } from "./cards";
+import { GameEngine, type EngineAction } from "./GameEngine";
 
 export interface HoldemPlayer {
   id: number;
@@ -53,6 +54,17 @@ export interface AgentStyle {
 export interface HoldemAction {
   type: "fold" | "check" | "call" | "raise";
   toAmount?: number; // raise 时用：加注后本轮总投入
+}
+
+/** 引擎动作流水里的一条（比 HoldemAction 多了玩家、街与金额，供复盘使用） */
+export interface HoldemEngineAction extends EngineAction {
+  type: "fold" | "check" | "call" | "raise";
+  /** raise 时的目标总投入 */
+  toAmount?: number;
+  /** 本次实际投入的筹码 */
+  amount: number;
+  /** 发生在哪条街 */
+  phase: HoldemPhase;
 }
 
 // ===================== 手牌评估 =====================
@@ -199,7 +211,7 @@ export function suggestHoldemAction(state: HoldemState, playerId: number, style:
 
 // ===================== 游戏主体 =====================
 
-export class HoldemGame {
+export class HoldemGame extends GameEngine<HoldemState, HoldemEngineAction> {
   private players: HoldemPlayer[] = [];
   private community: Card[] = [];
   private phase: HoldemPhase = "preflop";
@@ -217,6 +229,7 @@ export class HoldemGame {
 
   constructor(config: { names: string[]; agentIds?: (string | undefined)[]; stacks?: number[]; smallBlind?: number; bigBlind?: number }) {
     const { names, agentIds, stacks, smallBlind = 5, bigBlind = 10 } = config;
+    super();
     this.smallBlind = smallBlind;
     this.bigBlind = bigBlind;
     this.minRaise = bigBlind;
@@ -247,6 +260,7 @@ export class HoldemGame {
   }
 
   private startHand() {
+    this.resetActions();
     // 破产玩家：标记 isBusted 并退出后续手牌（仍保留在牌桌上置灰显示）
     for (const p of this.players) {
       if (p.stack <= 0) {
@@ -348,6 +362,28 @@ export class HoldemGame {
     p.committed += pay;
     this.pot += pay;
     if (p.stack === 0) p.isAllIn = true;
+  }
+
+  /**
+   * 统一的动作执行入口：记录流水 → 执行 → 推进。
+   * 只有真正改变了玩家状态（lastAction 变化 / 弃牌）的动作才会记进流水，
+   * 避免把「不能过牌」这类无效调用也写进复盘。
+   */
+  private perform(playerId: number, action: HoldemAction): void {
+    const p = this.players[playerId];
+    const beforeAction = p.lastAction;
+    const beforeCommitted = p.committed;
+    this.act(playerId, action);
+    const changed = p.hasFolded || p.lastAction !== beforeAction;
+    if (changed) {
+      this.record({
+        playerId,
+        type: action.type,
+        toAmount: action.toAmount,
+        amount: p.committed - beforeCommitted,
+        phase: this.phase,
+      });
+    }
   }
 
   private act(playerId: number, action: HoldemAction) {
@@ -509,25 +545,25 @@ export class HoldemGame {
   // 公共 API
   fold(playerId: number): HoldemState {
     if (this.currentPlayerId !== playerId || this.phase === "handover" || this.phase === "matchover") return this.getState();
-    this.act(playerId, { type: "fold" });
+    this.perform(playerId, { type: "fold" });
     this.afterAction();
     return this.getState();
   }
   check(playerId: number): HoldemState {
     if (this.currentPlayerId !== playerId) return this.getState();
-    this.act(playerId, { type: "check" });
+    this.perform(playerId, { type: "check" });
     this.afterAction();
     return this.getState();
   }
   call(playerId: number): HoldemState {
     if (this.currentPlayerId !== playerId) return this.getState();
-    this.act(playerId, { type: "call" });
+    this.perform(playerId, { type: "call" });
     this.afterAction();
     return this.getState();
   }
   raiseTo(playerId: number, toAmount: number): HoldemState {
     if (this.currentPlayerId !== playerId) return this.getState();
-    this.act(playerId, { type: "raise", toAmount });
+    this.perform(playerId, { type: "raise", toAmount });
     this.afterAction();
     return this.getState();
   }

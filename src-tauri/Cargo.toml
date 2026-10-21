@@ -4,21 +4,22 @@ version = "0.1.0"
 description = "我和大模型玩扑克"
 authors = ["you"]
 edition = "2021"
+rust-version = "1.77.2"
 
 [lib]
 name = "puke_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "1.5", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "1.6", features = [] }
+tauri = { version = "2", features = [] }
+# 本地持久化：SQLite（前端通过 @tauri-apps/plugin-sql 访问）
+tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rand = "0.8"
-reqwest = { version = "0.12", features = ["json"] }
 
 [features]
-default = ["custom-protocol"]
+default = []
 custom-protocol = ["tauri/custom-protocol"]
