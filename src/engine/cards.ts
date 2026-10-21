@@ -76,6 +76,18 @@ export function ddzValue(card: Card): number {
   return card.rank === 2 ? 15 : card.rank;
 }
 
+/** 斗地主牌力值 → 点数文本（17→大王，16→小王，15→2，14→A …），用于算牌提示 */
+export function ddzValueLabel(v: number): string {
+  if (v === 17) return "大王";
+  if (v === 16) return "小王";
+  if (v === 15) return "2";
+  if (v === 14) return "A";
+  if (v === 13) return "K";
+  if (v === 12) return "Q";
+  if (v === 11) return "J";
+  return String(v);
+}
+
 /** 斗地主手牌排序：牌力大的在前（2 紧随 A 之后、王之前），同点数按花色固定顺序 */
 export function sortDdzCards(cards: Card[]): Card[] {
   const order: Record<Suit, number> = {

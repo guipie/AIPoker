@@ -5,16 +5,20 @@ import AgentModelEditor from "../components/AgentModelEditor.vue";
 import CardComp from "../components/Card.vue";
 import DoudizhuSeat from "../components/DoudizhuSeat.vue";
 import HandCards from "../components/HandCards.vue";
-import { SUIT_SYMBOL, rankLabel, type Card } from "../engine/cards";
+import { SUIT_SYMBOL, ddzValue, ddzValueLabel, rankLabel, type Card } from "../engine/cards";
 import {
   DoudizhuGame,
-  canBeat,
   detectPattern,
-  findAllBeats,
-  findBeats,
   suggestBid,
-  suggestLead,
 } from "../engine/doudizhu";
+import {
+  bestPlay,
+  candidatesForLlm,
+  enumeratePlays,
+  toLlmChoices,
+  type LlmChoice,
+  type PlayContext,
+} from "../engine/ddzCandidates";
 import { llmDdzBid, llmDdzDecision, type LlmConfig } from "../engine/llm";
 import { addMatchLog, agentById, pickAgents, recordResult, store } from "../store";
 import { configForAgent, shouldUseLlm } from "../utils/llmCheck";
@@ -90,8 +94,52 @@ function relationOf(pid: number, myId: number, n: number): string {
   return "";
 }
 
+/**
+ * 组装候选决策上下文。规则 AI 与大模型共用同一份「合法候选枚举」，
+ * 这样模型的选项永远合法，且它选的和规则 AI 认为最优的在同一坐标系里。
+ */
+function playContextOf(s: any, player: any): PlayContext {
+  const landlord = s.players.find((p: any) => p.role === "landlord") ?? null;
+  const handCounts: Record<number, number> = {};
+  for (const p of s.players) handCounts[p.id] = p.handCount;
+  return {
+    hand: player.hand as Card[],
+    last: s.lastPlay ? detectPattern(s.lastPlay) : null,
+    lastPlayerId: s.lastPlayerId ?? null,
+    myId: player.id,
+    landlordId: landlord ? landlord.id : null,
+    handCounts,
+  };
+}
+
+/**
+ * 剩余未出现的牌。让大模型直接读结果，而不是让它从 playedCards 里自己数——
+ * 数错牌是 LLM 打斗地主最常见的失分项。
+ */
+function remainingHint(s: any, player: any): string {
+  const hasJoker = s.players.length === 3;
+  const total = new Map<number, number>();
+  for (let v = 3; v <= 15; v++) total.set(v, 4);
+  if (hasJoker) {
+    total.set(16, 1);
+    total.set(17, 1);
+  }
+  const used = new Map<number, number>();
+  const bump = (v: number) => used.set(v, (used.get(v) ?? 0) + 1);
+  for (const c of player.hand as Card[]) bump(ddzValue(c));
+  for (const c of (s.playedCards ?? []) as Card[]) bump(ddzValue(c));
+  const parts: string[] = [];
+  for (const [v, t] of [...total].sort((a, b) => b[0] - a[0])) {
+    const left = t - (used.get(v) ?? 0);
+    if (left > 0) parts.push(`${ddzValueLabel(v)}×${left}`);
+  }
+  return parts.length
+    ? `【尚未出现的牌】（已剔除你的手牌与全场已出牌，用来判断对手手里还剩什么大牌）\n${parts.join("  ")}`
+    : "";
+}
+
 /** 组装给大模型的完整牌局上下文（配合 prompts.ts 的 doudizuRules） */
-function buildDdzInput(s: any, player: any) {
+function buildDdzInput(s: any, player: any, choices?: LlmChoice[], hint?: string) {
   const n = s.players.length;
   const landlord = s.players.find((p: any) => p.role === "landlord") ?? null;
   const farmerIds = s.players.filter((p: any) => p.role === "farmer").map((p: any) => p.name);
@@ -122,6 +170,9 @@ function buildDdzInput(s: any, player: any) {
     seats,
     recentActions,
     persona: agentFor(player.id)?.persona,
+    // 关键：把引擎枚举好的合法候选编号交给模型，让它做选择题
+    candidates: choices ?? toLlmChoices(playContextOf(s, player), ddzLabel, 14),
+    cardCountHint: hint ?? remainingHint(s, player),
   };
 }
 
@@ -387,19 +438,31 @@ async function driveBots() {
         sfx.chip();
         doBid(player.id, score, { source, reason });
       } else {
-        // LLM 决策：严格区分「LLM 明确选择不出」与「LLM 调用失败」，
-        // 否则 LLM 说“不压队友的牌”会被规则 AI 兜底强行出牌（bug：页面打出 6）
-        let ids: string[] | null = null;
-        let llmPass = false; // LLM 明确决定不出
-        let llmUsed = false; // LLM 正常返回了决策（含“不出”）
+        // 出牌阶段：引擎先枚举出**全部合法候选**，大模型与规则 AI 共用同一份。
+        // 让模型做选择题，而不是自己凭空构造牌面——那是它最大的失分点。
+        const ctx = playContextOf(s, player);
+        const cands = candidatesForLlm(ctx, 14);
+        const choices = cands.map((c, i) => ({
+          index: i + 1,
+          typeName: c.typeName,
+          cards: c.cards.map(ddzLabel),
+          handLeft: c.handLeft,
+          isBomb: c.isBomb,
+        }));
+        const hint = remainingHint(s, player);
+
+        let picked: Card[] | null = null; // 最终要出的牌
+        let llmPass = false; // LLM 明确选择不出
+        let source: "llm" | "rule" = "rule";
         let reason = ""; // LLM 给出的决策理由（写入明细）
+
         if (shouldUseLlm(agentFor(player.id))) {
           const aid = agentMap.value[player.id];
           let llmErr: string | null = null;
           try {
             const out = await llmDdzDecision(
               llmConfigFor(player.id),
-              buildDdzInput(s, player),
+              buildDdzInput(s, player, choices, hint),
               msg => {
                 llmErr = msg;
                 if (aid) markOffline(aid, msg);
@@ -407,76 +470,52 @@ async function driveBots() {
             );
             if (aid && !llmErr) markOnline(aid);
             if (out) {
-              llmUsed = true;
               reason = out.reason ?? "";
-              if (out.play && out.play.length) {
+              source = "llm";
+              const ci = out.choice;
+              if (typeof ci === "number" && Number.isInteger(ci)) {
+                // 编号模式（首选）：0 = 不出，其余对应候选下标
+                if (ci === 0) {
+                  llmPass = !!s.lastPlay; // 自由领出不能不出 → 视为无效，落回规则 AI
+                } else {
+                  const hit = cands[ci - 1];
+                  if (hit) picked = hit.cards;
+                  else source = "rule"; // 编号越界 → 当作调用失败
+                }
+              } else if (out.play && out.play.length) {
+                // 兼容旧格式：按牌面反查，必须每张都对得上，否则算失败
                 const map = new Map(player.hand.map((c: Card) => [ddzLabel(c), c.id]));
-                ids = out.play.map((l: string) => map.get(l)).filter(Boolean) as string[];
-                if (!ids.length) {
-                  // 给出的牌在手牌里一张都对不上 → 视为调用失败，走规则兜底
-                  llmUsed = false;
-                  llmPass = false;
-                  reason = "";
+                const ids = out.play.map((l: string) => map.get(l)).filter(Boolean) as string[];
+                if (ids.length === out.play.length) {
+                  picked = ids.map(id => player.hand.find((c: Card) => c.id === id)!);
+                } else {
+                  source = "rule";
                 }
               } else {
                 llmPass = true; // play 为 null/空 → 明确不出
               }
             }
           } catch {
-            llmUsed = false;
+            source = "rule";
           }
         }
 
-        if (ids && ids.length) {
-          const cards = ids.map(id => player.hand.find((c: Card) => c.id === id)!).filter(Boolean);
-          const pat = detectPattern(cards);
-          const lastPat = s.lastPlay ? detectPattern(s.lastPlay) : null;
-          const src = llmUsed ? "llm" : "rule";
-          if (pat && (!lastPat || canBeat(pat, lastPat))) {
-            sfx.play();
-            doPlay(player.id, ids, { source: src, reason });
-          } else if (lastPat) {
-            // 出的牌压不过/非法 → 不出（合法动作）
-            sfx.fold();
-            doPass(player.id, { source: src, reason: reason || "给我的牌压不过上家" });
-          } else {
-            // 自由领出但牌型非法 → 回退规则 AI 领出
-            const lead = suggestLead(player.hand);
-            sfx.play();
-            doPlay(
-              player.id,
-              lead.map(c => c.id),
-              { source: "rule", reason: "领出兜底" }
-            );
-          }
+        if (picked && picked.length) {
+          sfx.play();
+          doPlay(player.id, picked.map(c => c.id), { source, reason });
         } else if (llmPass && s.lastPlay) {
-          // 尊重 LLM 的「不出」决策（如不压队友的牌、保存实力）——不能被兜底覆盖
+          // 尊重 LLM 的「不出」（不压队友、保存实力）——不能被兜底覆盖
           sfx.fold();
-          doPass(player.id, { source: "llm", reason });
+          doPass(player.id, { source: "llm", reason: reason || "选择不出" });
         } else {
-          // LLM 失败 / 未启用 / 自由领出不能不出 → 规则 AI
-          const last = s.lastPlay ? detectPattern(s.lastPlay) : null;
-          if (!last) {
-            const lead = suggestLead(player.hand);
+          // 规则 AI：不再「有压就压最小的」，改用启发式评分从候选里选
+          const cards = bestPlay(ctx);
+          if (cards && cards.length) {
             sfx.play();
-            doPlay(
-              player.id,
-              lead.map(c => c.id),
-              { source: "rule", reason: "规则 AI 领出" }
-            );
+            doPlay(player.id, cards.map(c => c.id), { source: "rule", reason: "规则 AI 选牌" });
           } else {
-            const beats = findBeats(player.hand, last);
-            if (beats) {
-              sfx.play();
-              doPlay(
-                player.id,
-                beats.map(c => c.id),
-                { source: "rule", reason: "规则 AI 压牌" }
-              );
-            } else {
-              sfx.fold();
-              doPass(player.id, { source: "rule", reason: "规则 AI 无牌可压" });
-            }
+            sfx.fold();
+            doPass(player.id, { source: "rule", reason: "规则 AI 无牌可压" });
           }
         }
       }
@@ -589,7 +628,20 @@ function hint() {
   const last = state.value.lastPlay ? detectPattern(state.value.lastPlay) : null;
   const key = hintKeyOf();
   if (key !== hintKey.value) {
-    hintOptions.value = findAllBeats((me.value?.hand ?? []) as Card[], last);
+    // 与 agent 共用同一套候选枚举：按启发式评分降序，
+    // 第一个提示就是「AI 认为最优的一手」，之后的循环才是备选
+    const hctx: PlayContext = {
+      hand: (me.value?.hand ?? []) as Card[],
+      last,
+      lastPlayerId: state.value.lastPlayerId ?? null,
+      myId: 0,
+      landlordId:
+        (state.value.players as any[]).find((p: any) => p.role === "landlord")?.id ?? null,
+      handCounts: Object.fromEntries(
+        (state.value.players as any[]).map((p: any) => [p.id, p.handCount]),
+      ),
+    };
+    hintOptions.value = enumeratePlays(hctx).map(k => k.cards);
     hintKey.value = key;
     hintIdx.value = -1;
   }

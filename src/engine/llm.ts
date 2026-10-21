@@ -301,6 +301,20 @@ export async function llmDdzBid(
   }
 }
 
+/**
+ * 给大模型的一个「合法候选动作」。
+ * 引擎已枚举好所有能出的牌，模型只需做选择题，不必自己构造牌面——
+ * 这是修复「大模型老出非法牌 / 出最烂的牌」的关键。
+ */
+export interface LlmCandidate {
+  /** 编号，1 起；0 固定代表「不出」 */
+  index: number;
+  typeName: string;
+  cards: string[];
+  handLeft: number;
+  isBomb: boolean;
+}
+
 export interface DdzLlmInput {
   num: 3 | 4;
   myId: string; // 我的名字（prompt 内用于标识身份）
@@ -312,10 +326,16 @@ export interface DdzLlmInput {
   seats?: { name: string; role: string; handCount: number; relation?: string; isMe?: boolean }[];
   recentActions?: string[]; // 最近各家出牌结果（按时间顺序）
   persona?: string;
+  /** 引擎枚举出的合法候选；给了就启用「编号选择题」模式 */
+  candidates?: LlmCandidate[];
+  /** 剩余关键牌统计（帮模型算牌，避免它自己数） */
+  cardCountHint?: string;
 }
 
 export interface DdzLlmOutput {
   play: string[] | null; // 出这些牌；null 表示不出
+  /** 模型选择的候选编号（优先于 play）；0 = 不出 */
+  choice?: number;
   reason?: string;
 }
 
@@ -340,6 +360,7 @@ export async function llmDdzDecision(
           .join("\n"),
     );
   }
+  if (input.cardCountHint) extra.push(input.cardCountHint);
   if (input.recentActions && input.recentActions.length) {
     extra.push("【最近出牌记录】（最新在最后）\n" + input.recentActions.map((a) => `- ${a}`).join("\n"));
   }
@@ -348,26 +369,61 @@ export async function llmDdzDecision(
     extra.length ? "\n\n" + extra.join("\n\n") : ""
   }`;
 
-  const user = doudizuRules(
-    input.num,
-    input.landlordId,
-    input.myId,
-    input.farmerIds,
-    input.hand,
-    input.lastPlay,
-    input.playedCards,
-  );
+  const user =
+    doudizuRules(
+      input.num,
+      input.landlordId,
+      input.myId,
+      input.farmerIds,
+      input.hand,
+      input.lastPlay,
+      input.playedCards,
+    ) + buildCandidateSection(input);
 
   try {
     const text = await callChat(config, [
       { role: "system", content: system },
       { role: "user", content: user },
     ]);
-    const out = parseJsonObject<DdzLlmOutput>(text);
-    if (out && (out.play === null || Array.isArray(out.play))) return out;
+    const out = parseJsonObject<{ play?: string[] | null; choice?: number; reason?: string }>(text);
+    if (!out) return null;
+    // 编号选择题优先：模型给的牌面经常拼错，编号不会
+    if (Number.isInteger(out.choice)) {
+      return { play: null, choice: out.choice as number, reason: out.reason };
+    }
+    if (out.play === null || Array.isArray(out.play)) {
+      return { play: out.play ?? null, reason: out.reason };
+    }
     return null;
   } catch (e: any) {
     onError?.(e?.message ?? String(e));
     return null;
   }
+}
+
+/**
+ * 拼「本回合可选动作」段落，追加在用户自研 prompt 之后。
+ * 引擎已经枚举出全部合法候选，模型只需挑一个编号——把「算牌/枚举/拼写」
+ * 这些大模型不擅长的事全部收回到引擎侧。
+ */
+function buildCandidateSection(input: DdzLlmInput): string {
+  if (!input.candidates || input.candidates.length === 0) return "";
+  const canPass = !!input.lastPlay; // 自由领出时不能不出
+  const lines = input.candidates
+    .map(
+      (c) =>
+        `${c.index}. 【${c.typeName}】${c.cards.join(" ")} → 出完剩 ${c.handLeft} 张${
+          c.isBomb ? "（炸弹/王炸，慎用）" : ""
+        }`,
+    )
+    .join("\n");
+
+  return `\n\n===本回合可选动作（已经替你枚举好，必须且只能从中选一个，禁止自己组合新牌）===
+${canPass ? "0. 【不出】放弃本轮，让下家接手" : "（本轮由你首发，必须出牌，不能不出）"}
+${lines}
+
+===输出格式（本节覆盖前面的输出约定）===
+只输出一行 JSON：{"choice":编号,"reason":"一句话中文理由"}
+${canPass ? `不出则 {"choice":0,"reason":"..."}；` : ""}出第 N 个则 {"choice":N,"reason":"..."}
+要求：choice 必须是上面列出的编号；不要再输出 play 字段的牌面数组。`;
 }
