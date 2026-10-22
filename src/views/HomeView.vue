@@ -11,7 +11,8 @@ const displayAgents = computed(() => {
 
 function start(mode: "doudizhu" | "holdem") {
   sfx.click();
-  beginGame(mode); // 用默认/随机 agent 开局
+  // 带上 Agent 广场的多选对手；没选过就交给 pickAgents（优先默认 agent）
+  beginGame(mode, store.selectedAgentIds.length ? store.selectedAgentIds : undefined);
 }
 </script>
 

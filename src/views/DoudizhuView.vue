@@ -649,17 +649,26 @@ function removeBot() {
   requestNewGame(agentIds.value.slice(0, -1));
 }
 
+/** 防止 onMounted + onActivated 双触发：第一次还没检查完，第二次就把 pendingNewGame
+ *  当成空、随机抽两个内置 agent 再查一遍 → 弹出「没配置大模型」的假面板，牌局却照常开始 */
+let starting = false;
 async function maybeStart() {
-  if (store.pendingNewGame === "doudizhu") {
-    store.pendingNewGame = null;
-    const ids =
-      store.startAgents && store.startAgents.length ? store.startAgents.slice(0, 3) : pickAgents(2);
-    await requestNewGame(ids);
-  } else if (!game.value) {
-    await requestNewGame(pickAgents(2));
-  } else {
-    paused = false;
-    resumeIfNeeded();
+  if (starting) return;
+  starting = true;
+  try {
+    if (store.pendingNewGame === "doudizhu") {
+      store.pendingNewGame = null;
+      const ids =
+        store.startAgents && store.startAgents.length ? store.startAgents.slice(0, 3) : pickAgents(2);
+      await requestNewGame(ids);
+    } else if (!game.value) {
+      await requestNewGame(pickAgents(2));
+    } else {
+      paused = false;
+      resumeIfNeeded();
+    }
+  } finally {
+    starting = false;
   }
 }
 

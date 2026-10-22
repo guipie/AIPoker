@@ -77,9 +77,41 @@ const hasThoughts = computed(() => !!props.thoughts?.trim());
             >农民</span
           >
         </div>
+        <!-- 第二行：剩牌 + 思考状态（合并进座位卡，不额外占一行高度） -->
         <div class="mt-0.5 flex items-center gap-1 text-[11px] text-amber-100/80">
-          <span class="h-3 w-2 rounded-[2px] border border-indigo-300/40 bg-gradient-to-br from-indigo-600 to-indigo-900"></span>
-          <span>剩 {{ player.handCount }} 张</span>
+          <span class="h-3 w-2 shrink-0 rounded-[2px] border border-indigo-300/40 bg-gradient-to-br from-indigo-600 to-indigo-900"></span>
+          <span class="shrink-0">剩 {{ player.handCount }} 张</span>
+          <!-- 思考中：去掉超时后要让人知道它还在想；有推理内容可点 › 查看 -->
+          <span
+            v-if="isCurrent"
+            class="animate-think ml-auto flex min-w-0 items-center gap-1 rounded-full bg-black/55 px-1.5 py-0 text-[10px] leading-4 text-amber-200"
+          >
+            <button
+              v-if="hasThoughts"
+              class="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full bg-amber-300/25 text-[11px] font-black leading-none text-amber-100 transition-colors hover:bg-amber-300/50"
+              title="查看思考过程"
+              @click="emit('openThoughts')"
+            >
+              ›
+            </button>
+            <span class="truncate"
+              >思考中<template v-if="waited && waited > 0">·{{ waited }}s</template></span
+            >
+            <span class="flex shrink-0 gap-0.5"
+              ><i class="thinking-dot h-1 w-1 rounded-full bg-amber-300"></i
+              ><i class="thinking-dot h-1 w-1 rounded-full bg-amber-300" style="animation-delay: 0.18s"></i
+              ><i class="thinking-dot h-1 w-1 rounded-full bg-amber-300" style="animation-delay: 0.36s"></i
+            ></span>
+          </span>
+          <!-- 这一手想完了：卡片里留个小入口，随时回看它刚才怎么想的 -->
+          <button
+            v-else-if="hasThoughts"
+            class="ml-auto flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full bg-violet-500/25 text-[11px] font-black leading-none text-violet-200 transition-colors hover:bg-violet-500/45"
+            title="查看上一次的思考过程"
+            @click="emit('openThoughts')"
+          >
+            ›
+          </button>
         </div>
       </div>
     </div>
@@ -95,36 +127,6 @@ const hasThoughts = computed(() => !!props.thoughts?.trim());
       <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="conn.ok ? 'bg-emerald-400' : 'bg-rose-400'"></span>
       <span class="truncate">{{ conn.model }}</span>
       <span>{{ conn.checking ? "检测中…" : conn.ok ? "在线" : "不在线" }}</span>
-    </button>
-
-    <!-- 思考中（去掉超时后要让人知道它还在想：显示已等待秒数；有推理内容可点 › 查看） -->
-    <div
-      v-if="isCurrent"
-      class="animate-think flex items-center gap-1.5 rounded-full bg-black/55 px-2.5 py-0.5 text-[11px] text-amber-200 shadow"
-    >
-      <button
-        v-if="hasThoughts"
-        class="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-amber-300/25 text-[11px] font-black leading-none text-amber-100 transition-colors hover:bg-amber-300/50"
-        title="查看思考过程"
-        @click="emit('openThoughts')"
-      >
-        ›
-      </button>
-      <span>思考中<template v-if="waited && waited > 0"> · 已等 {{ waited }}s</template></span>
-      <span class="flex gap-0.5"
-        ><i class="thinking-dot h-1 w-1 rounded-full bg-amber-300"></i
-        ><i class="thinking-dot h-1 w-1 rounded-full bg-amber-300" style="animation-delay: 0.18s"></i
-        ><i class="thinking-dot h-1 w-1 rounded-full bg-amber-300" style="animation-delay: 0.36s"></i
-      ></span>
-    </div>
-    <!-- 这一手想完了：留在座位上，随时回看它刚才怎么想的 -->
-    <button
-      v-else-if="hasThoughts"
-      class="flex items-center gap-1 rounded-full bg-violet-500/20 px-2 py-0.5 text-[10px] font-bold text-violet-200 transition-colors hover:bg-violet-500/35"
-      title="查看上一次的思考过程"
-      @click="emit('openThoughts')"
-    >
-      › 思考过程
     </button>
 
     <!-- 最近一次出牌（在 agent 面前，下次出牌覆盖；自己「不出」时盖上 PASS） -->

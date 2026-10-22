@@ -194,15 +194,23 @@ function buildAgentsFromList(list: string[]) {
   driveBots();
 }
 
+/** 防止 onMounted + onActivated 双触发导致重复开局检查（与斗地主视图同一坑） */
+let starting = false;
 async function maybeStart() {
-  if (store.pendingNewGame === "holdem") {
-    store.pendingNewGame = null;
-    await requestNewGame();
-  } else if (!game.value) {
-    await requestNewGame();
-  } else {
-    paused = false;
-    resumeIfNeeded();
+  if (starting) return;
+  starting = true;
+  try {
+    if (store.pendingNewGame === "holdem") {
+      store.pendingNewGame = null;
+      await requestNewGame();
+    } else if (!game.value) {
+      await requestNewGame();
+    } else {
+      paused = false;
+      resumeIfNeeded();
+    }
+  } finally {
+    starting = false;
   }
 }
 

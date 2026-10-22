@@ -132,7 +132,7 @@ async function waitFor(pred, tries = 60, gap = 300) {
 
 // 1) 思考中 + › 入口
 const sawThinking = await waitFor(async () => (await text()).includes("思考中"));
-const hasWaitSec = /思考中 · 已等 \d+s/.test(await text());
+const hasWaitSec = /思考中·\d+s/.test(await text());
 const hasArrow = await waitFor(() => clickArrowPreview(), 20, 200);
 async function clickArrowPreview() {
   return page.evaluate(() => {
