@@ -35,3 +35,7 @@ Thumbs.db
 .env.*
 *.key
 *.pem
+
+# UI 走查截图产物
+.ddz-*.png
+.smoke.png
