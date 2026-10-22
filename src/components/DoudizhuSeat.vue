@@ -10,6 +10,8 @@ const props = defineProps<{
   isCurrent: boolean;
   // 该 agent 对应大模型的连通状态（启用大模型时才传）
   conn?: { ok: boolean; model: string; error?: string; checking?: boolean };
+  /** 该座位最近一个动作是「不出」：把自己上一次出的牌盖上 PASS */
+  passed?: boolean;
 }>();
 
 const emit = defineEmits<{ (e: "editModel"): void }>();
@@ -98,20 +100,34 @@ const initial = computed(() => (props.player.name || "?").slice(0, 1));
       <span class="flex gap-0.5"><i class="thinking-dot h-1 w-1 rounded-full bg-amber-300"></i><i class="thinking-dot h-1 w-1 rounded-full bg-amber-300" style="animation-delay:.18s"></i><i class="thinking-dot h-1 w-1 rounded-full bg-amber-300" style="animation-delay:.36s"></i></span>
     </div>
 
-    <!-- 最近一次出牌（在 agent 面前，下次出牌覆盖） -->
+    <!-- 最近一次出牌（在 agent 面前，下次出牌覆盖；自己「不出」时盖上 PASS） -->
     <div class="flex min-h-[46px] items-center justify-center">
-      <div
-        v-if="lastPlay.length"
-        class="flex items-center gap-1 rounded-xl border border-amber-300/25 bg-black/40 px-2 py-1 shadow"
-      >
+      <div v-if="lastPlay.length" class="relative">
         <div
-          v-for="(c, i) in lastPlay"
-          :key="c.id"
-          class="animate-card-fly"
-          :style="{ marginLeft: i === 0 ? '0' : '-22px', zIndex: i }"
+          class="flex items-center gap-1 rounded-xl border border-amber-300/25 bg-black/40 px-2 py-1 shadow transition-opacity"
+          :class="passed ? 'opacity-40' : ''"
         >
-          <CardComp :card="c" small />
+          <div
+            v-for="(c, i) in lastPlay"
+            :key="c.id"
+            class="animate-card-fly"
+            :style="{ marginLeft: i === 0 ? '0' : '-22px', zIndex: i }"
+          >
+            <CardComp :card="c" small />
+          </div>
         </div>
+        <div
+          v-if="passed"
+          class="pointer-events-none absolute inset-0 flex items-center justify-center"
+        >
+          <span class="pass-stamp pass-stamp-sm text-xl">PASS</span>
+        </div>
+      </div>
+      <div
+        v-else-if="passed"
+        class="rounded-full bg-rose-600/90 px-2.5 py-0.5 text-[11px] font-black tracking-wide text-white shadow"
+      >
+        不出
       </div>
     </div>
   </div>

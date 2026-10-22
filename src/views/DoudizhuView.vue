@@ -10,6 +10,7 @@ import {
   DoudizhuGame,
   detectPattern,
   suggestBid,
+  type DdzAction,
 } from "../engine/doudizhu";
 import {
   bestPlay,
@@ -53,8 +54,48 @@ const isBidding = computed(() => state.value?.phase === "bidding");
 const isPlaying = computed(() => state.value?.phase === "playing");
 const isGameOver = computed(() => state.value?.phase === "gameover");
 const currentBid = computed(() => state.value?.currentBid ?? 0);
-// 桌面中央：当前需要压过的那一手（最近一次成功出牌），用于判断该出什么
-const centerCards = computed<Card[]>(() => state.value?.lastPlay ?? []);
+
+// 上一轮真正打出的牌快照：新一轮开始（大家都不要）时引擎会清空 lastPlay，
+// 这里留一份，好让「PASS」有东西可盖——否则桌面一空，谁不要了根本看不出来。
+const lastRoundCards = ref<Card[]>([]);
+const lastRoundBy = ref<number | null>(null);
+
+// 桌面中央：当前需要压过的那一手；没有则沿用上一轮快照（会盖 PASS）
+const centerCards = computed<Card[]>(() => {
+  const lp = state.value?.lastPlay as Card[] | null | undefined;
+  if (lp && lp.length) return lp;
+  return lastRoundCards.value;
+});
+
+/** 中央区是否要盖 PASS：最近一个动作是「不出」就盖，并数出连续几家不要 */
+const passOverlay = computed<{ name: string; count: number; freeLead: boolean } | null>(() => {
+  const s = state.value;
+  if (!s || s.phase !== "playing") return null;
+  const acts: DdzAction[] = s.recentActions ?? [];
+  let count = 0;
+  let who: number | null = null;
+  for (let i = acts.length - 1; i >= 0; i--) {
+    if (acts[i].type !== "pass") break;
+    count++;
+    if (who === null) who = acts[i].playerId;
+  }
+  if (!count || who === null) return null;
+  return {
+    name: s.players[who]?.name ?? `玩家${who}`,
+    count,
+    freeLead: !s.lastPlay, // 其余人全不要 → 上一手作废，由打出者重新领出
+  };
+});
+
+/** 每个座位最近一个动作是不是「不出」（自己上一次出的牌上盖 PASS） */
+const passFlags = computed<Record<number, boolean>>(() => {
+  const flags: Record<number, boolean> = {};
+  for (const a of (state.value?.recentActions ?? []) as DdzAction[]) {
+    flags[a.playerId] = a.type === "pass";
+  }
+  return flags;
+});
+const myPassed = computed(() => passFlags.value[0] ?? false);
 
 const iWin = computed(() => {
   if (!state.value?.winner) return false;
@@ -186,6 +227,91 @@ function buildPrePersons(s: any) {
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
+
+// ===== 大模型调用失败：暂停该 agent 的决策，等用户点「重试」 =====
+type LlmStage = "抢地主" | "出牌";
+interface LlmFailInfo {
+  playerId: number;
+  playerName: string;
+  agentId: string;
+  agentName: string;
+  stage: LlmStage;
+  error: string;
+  attempts: number;
+}
+type LlmFailChoice = "retry" | "fallback" | "mute";
+
+const llmFail = ref<LlmFailInfo | null>(null);
+/** 用户选择「本局不再提示」后，后续调用失败直接回退规则引擎，不再打断牌局 */
+const llmFailMuted = ref(false);
+let llmFailResolve: ((c: LlmFailChoice) => void) | null = null;
+
+function askLlmFail(info: LlmFailInfo): Promise<LlmFailChoice> {
+  return new Promise(resolve => {
+    llmFailResolve = resolve;
+    llmFail.value = info;
+  });
+}
+
+function resolveLlmFail(choice: LlmFailChoice) {
+  const r = llmFailResolve;
+  llmFailResolve = null;
+  llmFail.value = null;
+  r?.(choice);
+}
+
+/** 弹窗里的「✏️ 改模型」：直接打开该 agent 的模型配置 */
+function editFailModel() {
+  const pid = llmFail.value?.playerId;
+  if (pid == null) return;
+  openModelEditor(pid);
+}
+
+/**
+ * 调一次大模型；失败时把选择权交回用户（重试 / 用规则引擎 / 静默）。
+ * 「重试」会先重新体检该 agent 的连接（刷新在线徽章并给出更准的错误原因），
+ * 再重跑这一手的决策——不会像以前那样静默退化成规则 AI。
+ */
+async function withLlmRetry<T>(
+  pid: number,
+  stage: LlmStage,
+  call: (onError: (msg: string) => void) => Promise<T | null>
+): Promise<T | null> {
+  const aid = agentMap.value[pid] ?? "";
+  let attempts = 0;
+  for (;;) {
+    let err: string | null = null;
+    let out: T | null = null;
+    try {
+      out = await call(msg => {
+        err = msg;
+        if (aid) markOffline(aid, msg);
+      });
+    } catch (e: any) {
+      err = String(e?.message ?? e ?? "调用异常");
+      if (aid) markOffline(aid, err);
+    }
+    if (aid && !err) markOnline(aid);
+    if (out != null) return out;
+    attempts++;
+    if (llmFailMuted.value) return null; // 已静默：不再打断牌局
+    const choice = await askLlmFail({
+      playerId: pid,
+      playerName: state.value?.players?.[pid]?.name ?? `玩家${pid}`,
+      agentId: aid,
+      agentName: agentFor(pid)?.name ?? "AI 对手",
+      stage,
+      error: err ?? "大模型返回的内容无法解析（不是合法 JSON / 没给决策）",
+      attempts,
+    });
+    if (choice === "retry") {
+      if (aid) await recheckOne(aid);
+      continue;
+    }
+    if (choice === "mute") llmFailMuted.value = true;
+    return null;
+  }
+}
 
 // ===== 对局明细记录（抢地主 + 每一手出牌，结束后入库） =====
 const matchEntries = ref<MatchLogEntry[]>([]);
@@ -339,6 +465,12 @@ function newGame(ids?: string[]) {
   selectedIds.value.clear();
   thinkingId.value = null;
   paused = false;
+  // 重开时清掉桌面残留（上一轮的牌 / PASS 覆盖 / 失败提示静默开关）
+  lastRoundCards.value = [];
+  lastRoundBy.value = null;
+  llmFailMuted.value = false;
+  if (llmFailResolve) resolveLlmFail("fallback");
+  resetHint();
   store.activeGame = "doudizhu";
   sfx.deal();
   driveBots();
@@ -405,23 +537,19 @@ async function driveBots() {
         let score = suggestBid(player.hand);
         let reason = "";
         let source: "llm" | "rule" = "rule";
-        const aid = agentMap.value[player.id];
         if (shouldUseLlm(agentFor(player.id))) {
-          let llmErr: string | null = null;
-          const out = await llmDdzBid(
-            llmConfigFor(player.id),
-            {
-              num: s.players.length as 3 | 4,
-              myHand: player.hand.map(ddzLabel),
-              prePersons: buildPrePersons(s),
-              persona: agentFor(player.id)?.persona,
-            },
-            msg => {
-              llmErr = msg;
-              if (aid) markOffline(aid, msg);
-            }
+          const out = await withLlmRetry(player.id, "抢地主", onErr =>
+            llmDdzBid(
+              llmConfigFor(player.id),
+              {
+                num: s.players.length as 3 | 4,
+                myHand: player.hand.map(ddzLabel),
+                prePersons: buildPrePersons(s),
+                persona: agentFor(player.id)?.persona,
+              },
+              onErr
+            )
           );
-          if (aid && !llmErr) markOnline(aid);
           if (out) {
             source = "llm";
             reason = out.reason ?? "";
@@ -457,46 +585,39 @@ async function driveBots() {
         let reason = ""; // LLM 给出的决策理由（写入明细）
 
         if (shouldUseLlm(agentFor(player.id))) {
-          const aid = agentMap.value[player.id];
-          let llmErr: string | null = null;
+          let out: Awaited<ReturnType<typeof llmDdzDecision>> = null;
           try {
-            const out = await llmDdzDecision(
-              llmConfigFor(player.id),
-              buildDdzInput(s, player, choices, hint),
-              msg => {
-                llmErr = msg;
-                if (aid) markOffline(aid, msg);
-              }
+            out = await withLlmRetry(player.id, "出牌", onErr =>
+              llmDdzDecision(llmConfigFor(player.id), buildDdzInput(s, player, choices, hint), onErr)
             );
-            if (aid && !llmErr) markOnline(aid);
-            if (out) {
-              reason = out.reason ?? "";
-              source = "llm";
-              const ci = out.choice;
-              if (typeof ci === "number" && Number.isInteger(ci)) {
-                // 编号模式（首选）：0 = 不出，其余对应候选下标
-                if (ci === 0) {
-                  llmPass = !!s.lastPlay; // 自由领出不能不出 → 视为无效，落回规则 AI
-                } else {
-                  const hit = cands[ci - 1];
-                  if (hit) picked = hit.cards;
-                  else source = "rule"; // 编号越界 → 当作调用失败
-                }
-              } else if (out.play && out.play.length) {
-                // 兼容旧格式：按牌面反查，必须每张都对得上，否则算失败
-                const map = new Map(player.hand.map((c: Card) => [ddzLabel(c), c.id]));
-                const ids = out.play.map((l: string) => map.get(l)).filter(Boolean) as string[];
-                if (ids.length === out.play.length) {
-                  picked = ids.map(id => player.hand.find((c: Card) => c.id === id)!);
-                } else {
-                  source = "rule";
-                }
-              } else {
-                llmPass = true; // play 为 null/空 → 明确不出
-              }
-            }
           } catch {
-            source = "rule";
+            out = null;
+          }
+          if (out) {
+            reason = out.reason ?? "";
+            source = "llm";
+            const ci = out.choice;
+            if (typeof ci === "number" && Number.isInteger(ci)) {
+              // 编号模式（首选）：0 = 不出，其余对应候选下标
+              if (ci === 0) {
+                llmPass = !!s.lastPlay; // 自由领出不能不出 → 视为无效，落回规则 AI
+              } else {
+                const hit = cands[ci - 1];
+                if (hit) picked = hit.cards;
+                else source = "rule"; // 编号越界 → 当作调用失败
+              }
+            } else if (out.play && out.play.length) {
+              // 兼容旧格式：按牌面反查，必须每张都对得上，否则算失败
+              const map = new Map(player.hand.map((c: Card) => [ddzLabel(c), c.id]));
+              const ids = out.play.map((l: string) => map.get(l)).filter(Boolean) as string[];
+              if (ids.length === out.play.length) {
+                picked = ids.map(id => player.hand.find((c: Card) => c.id === id)!);
+              } else {
+                source = "rule";
+              }
+            } else {
+              llmPass = true; // play 为 null/空 → 明确不出
+            }
           }
         }
 
@@ -544,6 +665,11 @@ function applyState(next: any) {
   const prevPhase = state.value?.phase;
   const prevLast = ((state.value?.lastPlay ?? []) as Card[]).map(c => c.id).join(",");
   state.value = next;
+  // 记录「上一轮真正打出的牌」：新一轮开始 lastPlay 被清空后，PASS 才有牌可盖
+  if ((next?.lastPlay ?? []).length) {
+    lastRoundCards.value = next.lastPlay as Card[];
+    lastRoundBy.value = next.lastPlayerId ?? null;
+  }
   // 场上要压的牌变了 → 清掉上一轮的提示（下次点提示会按新形势重算）
   if (prevLast !== ((next?.lastPlay ?? []) as Card[]).map(c => c.id).join(",")) resetHint();
   // 抢地主结束、正式开打的那一刻，快照各家手牌（含地主底牌），供复盘查看
@@ -780,6 +906,14 @@ onDeactivated(() => {
           ⟳
         </button>
         <button
+          v-if="llmFailMuted"
+          class="rounded-full bg-rose-500/25 px-2 py-0.5 text-[10px] font-bold text-rose-200 hover:bg-rose-500/40"
+          title="本局内大模型调用失败不再打断牌局，直接回退内置规则引擎；点击恢复提示"
+          @click="llmFailMuted = false"
+        >
+          失败已静默
+        </button>
+        <button
           class="btn-ghost rounded-lg px-2 py-1.5 text-sm"
           :disabled="agentIds.length >= 3"
           @click="addBot"
@@ -833,6 +967,7 @@ onDeactivated(() => {
               :agent="agentFor(p.id)"
               :is-current="thinkingId === p.id"
               :conn="connFor(p.id)"
+              :passed="passFlags[p.id] ?? false"
               @edit-model="openModelEditor(p.id)"
             />
           </div>
@@ -851,15 +986,13 @@ onDeactivated(() => {
               </div>
             </div>
 
-            <div class="flex min-h-[92px] items-center justify-center">
-              <div
-                v-if="!centerCards.length || centerCards.length == 0"
-                class="text-sm text-white/40"
-              >
-                桌面空闲
-              </div>
+            <div class="relative flex min-h-[92px] items-center justify-center">
+              <div v-if="!centerCards.length" class="text-sm text-white/40">桌面空闲</div>
               <div v-else class="flex flex-col items-center gap-1">
-                <div class="flex animate-card-fly">
+                <div
+                  class="flex"
+                  :class="passOverlay ? 'opacity-40 saturate-50' : 'animate-card-fly'"
+                >
                   <div
                     v-for="(c, i) in centerCards"
                     :key="c.id"
@@ -873,6 +1006,27 @@ onDeactivated(() => {
                   class="rounded-full bg-black/50 px-2 py-0.5 text-[10px] text-amber-200/85"
                 >
                   {{ state.players[state.lastPlayerId]?.name }} 打出
+                </span>
+                <span
+                  v-else-if="passOverlay?.freeLead && lastRoundBy != null"
+                  class="rounded-full bg-black/50 px-2 py-0.5 text-[10px] text-amber-200/85"
+                >
+                  上一手作废 · 由 {{ state.players[lastRoundBy]?.name }} 重新领出
+                </span>
+              </div>
+
+              <!-- 有人「不要」：PASS 盖在上一轮出的牌上 -->
+              <div
+                v-if="passOverlay"
+                class="pointer-events-none absolute inset-0 z-20 flex flex-col items-center justify-center"
+              >
+                <span class="pass-stamp text-5xl">PASS</span>
+                <span
+                  class="-mt-1 rounded-full bg-black/70 px-2 py-0.5 text-[11px] font-bold text-rose-200 shadow"
+                >
+                  {{ passOverlay.name }} 不要<span v-if="passOverlay.count > 1">
+                    · 连续 {{ passOverlay.count }} 家</span
+                  >
                 </span>
               </div>
             </div>
@@ -973,17 +1127,30 @@ onDeactivated(() => {
         <!-- 你最近一次出牌（合并进信息行，省一整行高度；下次出牌覆盖） -->
         <div
           v-if="meLastPlay.length"
-          class="flex items-center gap-1.5 rounded-xl border border-amber-300/30 bg-black/45 px-2 py-0.5 shadow"
+          class="relative flex items-center gap-1.5 rounded-xl border border-amber-300/30 bg-black/45 px-2 py-0.5 shadow"
         >
           <div
             v-for="(c, i) in meLastPlay"
             :key="c.id"
             class="animate-card-fly"
+            :class="myPassed ? 'opacity-40' : ''"
             :style="{ marginLeft: i === 0 ? '0' : '-22px', zIndex: i }"
           >
             <CardComp :card="c" small />
           </div>
+          <div
+            v-if="myPassed"
+            class="pointer-events-none absolute inset-0 flex items-center justify-center"
+          >
+            <span class="pass-stamp pass-stamp-sm text-lg">PASS</span>
+          </div>
         </div>
+        <span
+          v-else-if="myPassed"
+          class="rounded-full bg-rose-600/85 px-2 py-0.5 text-[11px] font-black text-white shadow"
+        >
+          不出
+        </span>
       </div>
 
       <HandCards
@@ -1118,6 +1285,45 @@ onDeactivated(() => {
           </button>
           <button class="btn btn-ghost px-5 py-2 text-sm" @click="goSettings">去设置</button>
           <button class="btn btn-primary px-5 py-2 text-sm" @click="backToPlaza">返回广场</button>
+        </div>
+      </div>
+    </div>
+    <!-- 出牌过程中：某个 agent 的大模型调用失败 → 可重试，或交给规则引擎 -->
+    <div
+      v-if="llmFail"
+      class="absolute inset-0 z-[68] flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+    >
+      <div
+        class="w-[460px] max-w-[92vw] rounded-2xl border-2 border-amber-400/70 bg-gradient-to-b from-slate-800 to-slate-900 p-6 text-center shadow-2xl"
+      >
+        <div class="mb-1 text-4xl">📡</div>
+        <div class="mb-1 text-lg font-black text-amber-200">
+          「{{ llmFail.agentName }}」调用大模型失败
+        </div>
+        <div class="mb-3 text-sm text-white/70">
+          轮到 {{ llmFail.playerName }} {{ llmFail.stage }} · 第 {{ llmFail.attempts }} 次尝试
+        </div>
+        <div
+          class="mx-auto mb-4 max-h-32 overflow-y-auto rounded-lg border border-rose-400/30 bg-black/40 px-3 py-2 text-left text-xs text-rose-200/90"
+        >
+          {{ llmFail.error }}
+        </div>
+        <div class="flex flex-wrap justify-center gap-2">
+          <button class="btn btn-primary px-5 py-2 text-sm" @click="resolveLlmFail('retry')">
+            🔁 重试
+          </button>
+          <button class="btn btn-slate px-5 py-2 text-sm" @click="resolveLlmFail('fallback')">
+            用规则引擎出这手
+          </button>
+          <button class="btn btn-ghost px-4 py-2 text-xs" @click="editFailModel">
+            ✏️ 改模型
+          </button>
+          <button class="btn btn-ghost px-4 py-2 text-xs" @click="resolveLlmFail('mute')">
+            本局不再提示
+          </button>
+        </div>
+        <div class="mt-3 text-[11px] text-white/45">
+          重试会先重新检测该 agent 的接口连通性，成功后再让它重新决策这一手
         </div>
       </div>
     </div>
