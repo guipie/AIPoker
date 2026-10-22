@@ -17,42 +17,203 @@ interface ChatMessage {
   content: string;
 }
 
-/** 调用一次聊天补全，返回文本；失败/超时时抛错（调用方兜底） */
-export async function callChat(config: LlmConfig, messages: ChatMessage[]): Promise<string> {
-  const url = `${config.baseUrl.replace(/\/$/, "")}/chat/completions`;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 9000);
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
-      },
-      body: JSON.stringify({
-        model: config.model,
-        messages,
-        temperature: config.temperature,
-        response_format: { type: "json_object" },
-      }),
-      signal: ctrl.signal,
-    });
-    if (!resp.ok) {
-      // 带上服务端返回的 message（如“模型名不支持”），方便定位
-      let detail = "";
-      try {
-        const d = await resp.json();
-        detail = d?.error?.message ?? d?.message ?? "";
-      } catch {
-        /* ignore */
-      }
-      throw new Error(`HTTP ${resp.status}${detail ? "：" + detail : ""}`);
+// ===================== 底层调用：流式优先、不设超时 =====================
+//
+// 为什么不再超时：思考型模型（R1 / QwQ / o1 等）一步棋想一两分钟很正常，
+// 原来的 20s 超时会把「慢」误判成「离线」。这里改成一直等，并把模型吐出来的
+// reasoning_content 流式喂给 UI，让人看得见它还在想什么。
+
+/** 流式回调：思考增量 / 正文增量 / 换策略前清空 */
+export interface LlmStreamHooks {
+  /** 思考模型的推理增量（delta.reasoning_content / delta.reasoning） */
+  onThinking?: (chunk: string) => void;
+  /** 正式回答的增量（delta.content） */
+  onContent?: (chunk: string) => void;
+  /** 降级换一种请求策略前调用，用于清掉已累积的半截文本 */
+  onRestart?: () => void;
+}
+
+/** 调用参数：`onError` 兼容旧的「直接传一个函数」写法 */
+export interface LlmCallOptions {
+  onError?: (msg: string) => void;
+  hooks?: LlmStreamHooks;
+  /** 需要主动中断时传入（如重开牌局）。注意：**没有超时**，思考多久都等 */
+  signal?: AbortSignal;
+}
+
+export type LlmCallArg = LlmCallOptions | ((msg: string) => void);
+
+function asOptions(arg?: LlmCallArg): LlmCallOptions {
+  if (!arg) return {};
+  return typeof arg === "function" ? { onError: arg } : arg;
+}
+
+interface RequestStrategy {
+  stream: boolean;
+  json: boolean;
+}
+
+/**
+ * 请求策略逐级降级：
+ * 1. 流式 + JSON 模式（首选，能边想边显示）
+ * 2. 流式 + 纯文本（思考型模型普遍不支持 response_format=json_object）
+ * 3. 非流式 + JSON（老网关不支持 stream）
+ * 4. 非流式 + 纯文本（最保守，什么服务都能跑）
+ */
+const STRATEGIES: RequestStrategy[] = [
+  { stream: true, json: true },
+  { stream: true, json: false },
+  { stream: false, json: true },
+  { stream: false, json: false },
+];
+
+function headersOf(config: LlmConfig): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
+  };
+}
+
+function bodyOf(config: LlmConfig, messages: ChatMessage[], s: RequestStrategy): string {
+  return JSON.stringify({
+    model: config.model,
+    messages,
+    temperature: config.temperature,
+    ...(s.stream ? { stream: true } : {}),
+    ...(s.json ? { response_format: { type: "json_object" } } : {}),
+  });
+}
+
+/** 从一次性响应里取出正文（兼容 content 为字符串或分段数组） */
+function extractText(data: any): string {
+  const c = data?.choices?.[0]?.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) return c.map((p: any) => (typeof p === "string" ? p : (p?.text ?? ""))).join("");
+  return "";
+}
+
+/** 读一条 SSE / NDJSON 流，边读边把思考与正文推给回调 */
+async function readStream(
+  body: ReadableStream<Uint8Array>,
+  hooks?: LlmStreamHooks,
+): Promise<string> {
+  const reader = body.getReader();
+  const dec = new TextDecoder("utf-8");
+  let buf = "";
+  let content = "";
+  /** 处理一行；返回该行里的正文增量 */
+  const handleLine = (raw: string): string => {
+    let line = raw.trim();
+    if (!line) return "";
+    if (line.startsWith("data:")) line = line.slice(5).trim();
+    if (!line || line === "[DONE]") return "";
+    let chunk: any;
+    try {
+      chunk = JSON.parse(line);
+    } catch {
+      return ""; // SSE 注释行 / 心跳等
     }
-    const data = await resp.json();
-    return data?.choices?.[0]?.message?.content ?? "";
-  } finally {
-    clearTimeout(timer);
+    const choice = chunk?.choices?.[0] ?? {};
+    const delta = choice.delta ?? {};
+    const think =
+      typeof delta.reasoning_content === "string"
+        ? delta.reasoning_content
+        : typeof delta.reasoning === "string"
+          ? delta.reasoning
+          : "";
+    if (think) hooks?.onThinking?.(think);
+    const text =
+      typeof delta.content === "string"
+        ? delta.content
+        : // 少数实现不带 delta，直接把整段放在 message 里
+          (typeof choice.message?.content === "string" ? choice.message.content : "");
+    if (text) hooks?.onContent?.(text);
+    return text;
+  };
+  const drain = () => {
+    let nl = buf.indexOf("\n");
+    while (nl >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      content += handleLine(line);
+      nl = buf.indexOf("\n");
+    }
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    drain();
   }
+  // 最后一行可能没有换行符（如 `data: {...}` 直接收尾）：不冲掉就会丢掉结尾那段 JSON
+  buf += dec.decode();
+  content += handleLine(buf);
+  return content;
+}
+
+/** 按某种策略发一次请求 */
+async function requestOnce(
+  config: LlmConfig,
+  messages: ChatMessage[],
+  s: RequestStrategy,
+  hooks?: LlmStreamHooks,
+  signal?: AbortSignal,
+): Promise<string> {
+  const url = `${config.baseUrl.replace(/\/$/, "")}/chat/completions`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: headersOf(config),
+    body: bodyOf(config, messages, s),
+    signal,
+  });
+  if (!resp.ok) {
+    // 带上服务端返回的 message（如“模型名不支持”），方便定位
+    let detail = "";
+    try {
+      const d = await resp.json();
+      detail = d?.error?.message ?? d?.message ?? "";
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`HTTP ${resp.status}${detail ? "：" + detail : ""}`);
+  }
+  const ct = (resp.headers.get("content-type") ?? "").toLowerCase();
+  const looksStream =
+    ct.includes("text/event-stream") || ct.includes("application/x-ndjson") || ct.includes("stream");
+  if (!s.stream || !resp.body || !looksStream) {
+    // 服务端忽略了 stream 参数（直接返回一整包 JSON）→ 按普通响应处理
+    const data = await resp.json().catch(() => null);
+    const text = extractText(data);
+    if (!text) throw new Error("返回内容为空");
+    hooks?.onContent?.(text);
+    return text;
+  }
+  return await readStream(resp.body, hooks);
+}
+
+/**
+ * 调用一次聊天补全，返回完整文本。
+ * 流式优先；接口不支持时自动降级，绝不因为「想得久」而判失败。
+ */
+export async function callChat(
+  config: LlmConfig,
+  messages: ChatMessage[],
+  hooks?: LlmStreamHooks,
+  signal?: AbortSignal,
+): Promise<string> {
+  let lastErr: Error | null = null;
+  for (let i = 0; i < STRATEGIES.length; i++) {
+    try {
+      if (i > 0) hooks?.onRestart?.();
+      const text = await requestOnce(config, messages, STRATEGIES[i], hooks, signal);
+      if (text && text.trim()) return text;
+      lastErr = new Error("返回内容为空");
+    } catch (e: any) {
+      if (e?.name === "AbortError") throw e; // 主动取消：不再换策略重试
+      lastErr = e instanceof Error ? e : new Error(String(e));
+    }
+  }
+  throw lastErr ?? new Error("调用失败");
 }
 
 /** 从模型输出中解析 JSON（容错：截取第一个 {...}） */
@@ -93,7 +254,7 @@ async function probeByChat(
   base: string,
   headers: Record<string, string>,
   model: string,
-  signal: AbortSignal,
+  signal: AbortSignal
 ): Promise<ConnTestResult> {
   try {
     const r = await fetch(`${base}/chat/completions`, {
@@ -115,7 +276,10 @@ async function probeByChat(
       /* ignore */
     }
     if (r.status === 401 || r.status === 403) {
-      return { ok: false, error: `API Key 无效或已失效（HTTP ${r.status}）${detail ? "：" + detail : ""}` };
+      return {
+        ok: false,
+        error: `API Key 无效或已失效（HTTP ${r.status}）${detail ? "：" + detail : ""}`,
+      };
     }
     if (r.status === 404) {
       return { ok: false, error: `模型「${model}」不存在或接口地址不对（HTTP 404）` };
@@ -141,7 +305,7 @@ export function modelNotInList(available: string[], model: string): string | nul
   if (!ids.length) return null; // 列表为空 → 不做判断
   const m = (model ?? "").trim();
   if (!m) return null;
-  const hit = ids.some((id) => id.toLowerCase() === m.toLowerCase());
+  const hit = ids.some(id => id.toLowerCase() === m.toLowerCase());
   if (hit) return null;
   const hint = ids.slice(0, 6).join("、") + (ids.length > 6 ? "…" : "");
   return `模型「${m}」不在该接口支持的模型列表中（可用：${hint}）`;
@@ -152,7 +316,7 @@ async function parseModelIds(resp: Response): Promise<string[]> {
   try {
     const d = await resp.json();
     const arr = Array.isArray(d?.data) ? d.data : Array.isArray(d) ? d : [];
-    return arr.map((x: any) => (typeof x === "string" ? x : (x?.id ?? ""))).filter(Boolean);
+    return arr.map((x: any) => (typeof x === "string" ? x : x?.id ?? "")).filter(Boolean);
   } catch {
     return [];
   }
@@ -187,7 +351,10 @@ export async function testLlmConnection(config: LlmConfig): Promise<ConnTestResu
       /* ignore */
     }
     if (r.status === 401 || r.status === 403) {
-      return { ok: false, error: `API Key 无效或无权访问（HTTP ${r.status}）${detail ? "：" + detail : ""}` };
+      return {
+        ok: false,
+        error: `API Key 无效或无权访问（HTTP ${r.status}）${detail ? "：" + detail : ""}`,
+      };
     }
     if (r.status === 404) {
       // 该服务没有 /models 端点，改用极短对话验证
@@ -228,26 +395,38 @@ export interface HoldemLlmOutput {
 export async function llmHoldemDecision(
   config: LlmConfig,
   input: HoldemLlmInput,
-  onError?: (msg: string) => void,
+  arg?: LlmCallArg
 ): Promise<HoldemLlmOutput | null> {
+  const { onError, hooks, signal } = asOptions(arg);
   const system = `你是一名德州扑克 AI 玩家${
     input.persona ? "，人设：" + input.persona : ""
   }。请根据牌局给出行动。只输出 JSON，格式：{"action":"fold"|"check"|"call"|"raise","raiseTo":<加注后本轮总投入整数，仅 raise 时>,"reason":"简短中文理由"}。注意底池赔率与手牌强度，避免无谓跟注。`;
   const user = `我的手牌：${input.hole.join(" ")}
 公共牌：${input.community.length ? input.community.join(" ") : "（暂无）"}
-底池：${input.pot}  需跟注：${input.toCall}  最小加注到：${input.currentBet + input.minRaise}  我的筹码：${input.stack}
+底池：${input.pot}  需跟注：${input.toCall}  最小加注到：${
+    input.currentBet + input.minRaise
+  }  我的筹码：${input.stack}
 座位（${input.position}）：
-${input.players.map((p) => `- ${p.name} 筹码${p.stack} 已投入${p.committed}${p.folded ? " 已弃牌" : ""}`).join("\n")}
+${input.players
+  .map(p => `- ${p.name} 筹码${p.stack} 已投入${p.committed}${p.folded ? " 已弃牌" : ""}`)
+  .join("\n")}
 请决策。`;
   try {
-    const text = await callChat(config, [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ]);
+    const text = await callChat(
+      config,
+      [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      hooks,
+      signal
+    );
     const out = parseJsonObject<HoldemLlmOutput>(text);
     if (out && ["fold", "check", "call", "raise"].includes(out.action)) return out;
     return null;
   } catch (e: any) {
+    // 主动中断（换局 / 离开牌桌）不是失败：原样抛给调用方，不在这里报告离线
+    if (e?.name === "AbortError") throw e;
     onError?.(e?.message ?? String(e));
     return null;
   }
@@ -274,17 +453,25 @@ export interface DdzBidOutput {
 export async function llmDdzBid(
   config: LlmConfig,
   input: DdzBidInput,
-  onError?: (msg: string) => void,
+  arg?: LlmCallArg
 ): Promise<DdzBidOutput | null> {
-  const system = `你是一名斗地主 AI 玩家${input.persona ? "，人设：" + input.persona : ""}。严格遵守【输出约定】：只输出原始 JSON，不要 markdown、不要解释文字、不要多余换行。`;
+  const { onError, hooks, signal } = asOptions(arg);
+  const system = `你是一名斗地主 AI 玩家${
+    input.persona ? "，人设：" + input.persona : ""
+  }。严格遵守【输出约定】：只输出原始 JSON，不要 markdown、不要解释文字、不要多余换行。`;
   const user = qiangDoudizuRules(input.num, input.prePersons, input.myHand);
   try {
-    const text = await callChat(config, [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ]);
+    const text = await callChat(
+      config,
+      [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      hooks,
+      signal
+    );
     const out = parseJsonObject<{ action?: string; snatchScore?: number | null; reason?: string }>(
-      text,
+      text
     );
     if (!out) return null;
     if (out.action === "pass") return { action: "pass", snatchScore: null, reason: out.reason };
@@ -296,6 +483,8 @@ export async function llmDdzBid(
     }
     return null;
   } catch (e: any) {
+    // 主动中断（换局 / 离开牌桌）不是失败：原样抛给调用方，不在这里报告离线
+    if (e?.name === "AbortError") throw e;
     onError?.(e?.message ?? String(e));
     return null;
   }
@@ -343,8 +532,9 @@ export interface DdzLlmOutput {
 export async function llmDdzDecision(
   config: LlmConfig,
   input: DdzLlmInput,
-  onError?: (msg: string) => void,
+  arg?: LlmCallArg
 ): Promise<DdzLlmOutput | null> {
+  const { onError, hooks, signal } = asOptions(arg);
   // 局势补充信息放在 system 里，保证 user 段落是 prompts.ts 原样输出
   const extra: string[] = [];
   if (input.seats && input.seats.length) {
@@ -352,20 +542,24 @@ export async function llmDdzDecision(
       "【各家剩余手牌】（按出牌顺序）\n" +
         input.seats
           .map(
-            (p) =>
+            p =>
               `- ${p.name}（${p.role}${p.relation ? "，" + p.relation : ""}）剩 ${p.handCount} 张${
                 p.handCount <= 2 ? " ⚠️快走完了，优先封堵" : ""
-              }`,
+              }`
           )
-          .join("\n"),
+          .join("\n")
     );
   }
   if (input.cardCountHint) extra.push(input.cardCountHint);
   if (input.recentActions && input.recentActions.length) {
-    extra.push("【最近出牌记录】（最新在最后）\n" + input.recentActions.map((a) => `- ${a}`).join("\n"));
+    extra.push(
+      "【最近出牌记录】（最新在最后）\n" + input.recentActions.map(a => `- ${a}`).join("\n")
+    );
   }
 
-  const system = `你是一名斗地主 AI 玩家${input.persona ? "，人设：" + input.persona : ""}。严格遵守【输出约定】：只输出原始 JSON，不要 markdown、不要解释文字、不要多余换行。${
+  const system = `你是一名斗地主 AI 玩家${
+    input.persona ? "，人设：" + input.persona : ""
+  }。严格遵守【输出约定】：只输出原始 JSON，不要 markdown、不要解释文字、不要多余换行。${
     extra.length ? "\n\n" + extra.join("\n\n") : ""
   }`;
 
@@ -377,14 +571,19 @@ export async function llmDdzDecision(
       input.farmerIds,
       input.hand,
       input.lastPlay,
-      input.playedCards,
+      input.playedCards
     ) + buildCandidateSection(input);
 
   try {
-    const text = await callChat(config, [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ]);
+    const text = await callChat(
+      config,
+      [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+      hooks,
+      signal
+    );
     const out = parseJsonObject<{ play?: string[] | null; choice?: number; reason?: string }>(text);
     if (!out) return null;
     // 编号选择题优先：模型给的牌面经常拼错，编号不会
@@ -396,6 +595,8 @@ export async function llmDdzDecision(
     }
     return null;
   } catch (e: any) {
+    // 主动中断（换局 / 离开牌桌）不是失败：原样抛给调用方，不在这里报告离线
+    if (e?.name === "AbortError") throw e;
     onError?.(e?.message ?? String(e));
     return null;
   }
@@ -411,10 +612,10 @@ function buildCandidateSection(input: DdzLlmInput): string {
   const canPass = !!input.lastPlay; // 自由领出时不能不出
   const lines = input.candidates
     .map(
-      (c) =>
+      c =>
         `${c.index}. 【${c.typeName}】${c.cards.join(" ")} → 出完剩 ${c.handLeft} 张${
           c.isBomb ? "（炸弹/王炸，慎用）" : ""
-        }`,
+        }`
     )
     .join("\n");
 

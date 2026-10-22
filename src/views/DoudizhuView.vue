@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onActivated, onDeactivated, onMounted, ref, watch } from "vue";
-import { sfx } from "../audio/sfx";
+import { computed, nextTick, onActivated, onDeactivated, onMounted, ref, watch } from "vue";
+import { sfx, type DdzSoundKind } from "../audio/sfx";
 import AgentModelEditor from "../components/AgentModelEditor.vue";
 import CardComp from "../components/Card.vue";
 import DoudizhuSeat from "../components/DoudizhuSeat.vue";
@@ -20,7 +20,7 @@ import {
   type LlmChoice,
   type PlayContext,
 } from "../engine/ddzCandidates";
-import { llmDdzBid, llmDdzDecision, type LlmConfig } from "../engine/llm";
+import { llmDdzBid, llmDdzDecision, type LlmCallOptions, type LlmConfig } from "../engine/llm";
 import { addMatchLog, agentById, pickAgents, recordResult, store } from "../store";
 import { configForAgent, shouldUseLlm } from "../utils/llmCheck";
 import { useAgentConnection } from "../composables/useAgentConnection";
@@ -43,6 +43,19 @@ const { markOffline, markOnline, recheckOne, connOf } = conn;
 
 let running = false;
 let paused = false;
+/** 牌局序号：每开一局 +1，用来丢弃「上一局还没回来的大模型结果」 */
+let gameSeq = 0;
+/**
+ * 换局时中断在途的大模型请求。
+ * 取消超时后一次思考可能几分钟，旧局不清掉会一直占着连接（也白烧 token）。
+ */
+let llmAbort: AbortController | null = null;
+
+function armLlmAbort() {
+  llmAbort?.abort();
+  llmAbort = new AbortController();
+  return llmAbort.signal;
+}
 
 const me = computed(() => state.value?.players.find((p: any) => p.isHuman) ?? null);
 const meLastPlay = computed<Card[]>(() => me.value?.lastPlay ?? []);
@@ -119,6 +132,63 @@ function llmConfigFor(id: number): LlmConfig {
 function ddzLabel(c: Card): string {
   if (c.suit === "joker") return c.rank === 17 ? "大王" : "小王";
   return SUIT_SYMBOL[c.suit] + rankLabel(c);
+}
+
+// ===== 出牌播报：念牌名（对二 / 炸弹 / 不要）+ 牌型音效 =====
+/** 斗地主牌桌上的中文叫法：J=勾、Q=圈、K=凯、A=尖、2=二 */
+const CN_RANK: Record<number, string> = {
+  3: "三",
+  4: "四",
+  5: "五",
+  6: "六",
+  7: "七",
+  8: "八",
+  9: "九",
+  10: "十",
+  11: "勾",
+  12: "圈",
+  13: "凯",
+  14: "尖",
+  15: "二",
+  16: "小王",
+  17: "大王",
+};
+
+/** 一手牌该念什么 + 用哪种音型 */
+function announceOf(cards: Card[]): { label: string; kind: DdzSoundKind } {
+  const p = detectPattern(cards);
+  if (!p) return { label: "出牌", kind: "single" };
+  const n = CN_RANK[p.mainRank] ?? String(p.mainRank);
+  switch (p.type) {
+    case "rocket":
+      return { label: "王炸", kind: "rocket" };
+    case "bomb":
+      return { label: "炸弹", kind: "bomb" };
+    case "single":
+      return { label: n, kind: "single" };
+    case "pair":
+      return { label: `对${n}`, kind: "pair" };
+    case "triple":
+      return { label: `三张${n}`, kind: "triple" };
+    case "triple_single":
+      return { label: "三带一", kind: "triple_single" };
+    case "triple_pair":
+      return { label: "三带二", kind: "triple_pair" };
+    case "straight":
+      return { label: "顺子", kind: "straight" };
+    case "pair_straight":
+      return { label: "连对", kind: "pair_straight" };
+    case "airplane":
+      return { label: "飞机", kind: "airplane" };
+    case "airplane_single":
+      return { label: "飞机带单", kind: "airplane_single" };
+    case "airplane_pair":
+      return { label: "飞机带对", kind: "airplane_pair" };
+    case "four_two_single":
+      return { label: "四带二", kind: "four_two_single" };
+    case "four_two_pair":
+      return { label: "四带两对", kind: "four_two_pair" };
+  }
 }
 
 function roleText(r: string | null | undefined): string {
@@ -228,6 +298,63 @@ function buildPrePersons(s: any) {
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
+// ===== 思考态：等了多久 + 模型的推理过程（reasoning_content） =====
+// 去掉超时后，「它在想」和「它挂了」在界面上必须能区分开：座位显示已等待秒数。
+const thinkingSince = ref<number | null>(null);
+const nowTick = ref(Date.now());
+/** pid → 该 agent 最近一次决策的思考文本（流式累积） */
+const thoughts = ref<Record<number, string>>({});
+/** 正在查看谁家思考过程的弹层 */
+const thoughtPid = ref<number | null>(null);
+const thoughtBox = ref<HTMLElement | null>(null);
+let tickTimer: ReturnType<typeof setInterval> | null = null;
+
+const waitedSec = computed(() =>
+  thinkingSince.value == null
+    ? 0
+    : Math.max(0, Math.floor((nowTick.value - thinkingSince.value) / 1000))
+);
+
+function beginThinking(pid: number) {
+  thinkingId.value = pid;
+  thinkingSince.value = Date.now();
+  nowTick.value = Date.now();
+}
+function endThinking() {
+  thinkingId.value = null;
+  thinkingSince.value = null;
+}
+function addThought(pid: number, chunk: string) {
+  thoughts.value = { ...thoughts.value, [pid]: (thoughts.value[pid] ?? "") + chunk };
+}
+function resetThought(pid: number) {
+  if (!thoughts.value[pid]) return;
+  thoughts.value = { ...thoughts.value, [pid]: "" };
+}
+function openThoughts(pid: number) {
+  sfx.click();
+  thoughtPid.value = pid;
+}
+function startTick() {
+  if (tickTimer) return;
+  tickTimer = setInterval(() => {
+    nowTick.value = Date.now();
+  }, 1000);
+}
+function stopTick() {
+  if (!tickTimer) return;
+  clearInterval(tickTimer);
+  tickTimer = null;
+}
+
+/** 弹层当前展示的座位与该座的思考文本 */
+const thoughtPlayer = computed(() =>
+  thoughtPid.value == null ? null : (state.value?.players?.[thoughtPid.value] ?? null)
+);
+const currentThought = computed(() =>
+  thoughtPid.value == null ? "" : (thoughts.value[thoughtPid.value] ?? "")
+);
+
 // ===== 大模型调用失败：暂停该 agent 的决策，等用户点「重试」 =====
 type LlmStage = "抢地主" | "出牌";
 interface LlmFailInfo {
@@ -275,22 +402,36 @@ function editFailModel() {
 async function withLlmRetry<T>(
   pid: number,
   stage: LlmStage,
-  call: (onError: (msg: string) => void) => Promise<T | null>
+  call: (opts: LlmCallOptions) => Promise<T | null>
 ): Promise<T | null> {
   const aid = agentMap.value[pid] ?? "";
   let attempts = 0;
   for (;;) {
     let err: string | null = null;
     let out: T | null = null;
+    let aborted = false;
     try {
-      out = await call(msg => {
-        err = msg;
-        if (aid) markOffline(aid, msg);
+      out = await call({
+        onError: msg => {
+          err = msg;
+          if (aid) markOffline(aid, msg);
+        },
+        // 思考过程流式回传：座位上点「›」就能看它在想什么
+        hooks: {
+          onThinking: chunk => addThought(pid, chunk),
+          onRestart: () => resetThought(pid),
+        },
+        signal: llmAbort?.signal,
       });
     } catch (e: any) {
-      err = String(e?.message ?? e ?? "调用异常");
-      if (aid) markOffline(aid, err);
+      // 换局导致的中断：既不算失败，也不要弹重试面板
+      if (e?.name === "AbortError") aborted = true;
+      else {
+        err = String(e?.message ?? e ?? "调用异常");
+        if (aid) markOffline(aid, err);
+      }
     }
+    if (aborted) return null;
     if (aid && !err) markOnline(aid);
     if (out != null) return out;
     attempts++;
@@ -324,7 +465,7 @@ function pushLog(e: MatchLogEntry) {
   matchEntries.value.push(e);
 }
 
-/** 出牌（统一入口）：真的生效了才写日志 */
+/** 出牌（统一入口）：真的生效了才写日志 + 播报 */
 function doPlay(
   pid: number,
   ids: string[],
@@ -332,10 +473,8 @@ function doPlay(
 ) {
   const g = game.value!;
   const hand = state.value.players[pid].hand as Card[];
-  const labels = ids.map(id => {
-    const c = hand.find(x => x.id === id);
-    return c ? ddzLabel(c) : id;
-  });
+  const cards = ids.map(id => hand.find(x => x.id === id)).filter((c): c is Card => !!c);
+  const labels = cards.map(ddzLabel);
   const before = state.value.actionCount ?? 0;
   const next = g.play(pid, ids);
   applyState(next);
@@ -349,6 +488,9 @@ function doPlay(
       source: meta.source,
       reason: meta.reason,
     });
+    // 每次出牌都播报：念牌名（对二 / 炸弹）+ 牌型音效
+    const a = announceOf(cards);
+    sfx.playDdz(a.label, a.kind);
     return true;
   }
   return false;
@@ -369,6 +511,7 @@ function doPass(pid: number, meta: { source: "llm" | "rule" | "human"; reason?: 
       source: meta.source,
       reason: meta.reason,
     });
+    sfx.playDdz("不要", "pass");
     return true;
   }
   return false;
@@ -393,6 +536,7 @@ function doBid(
     source: meta.source,
     reason: meta.reason,
   });
+  sfx.say(eff > 0 ? `${eff}分` : "不叫");
 }
 
 /** 一局结束：把明细入库，并在战绩里挂上 logId */
@@ -463,7 +607,11 @@ function newGame(ids?: string[]) {
   lastLogId.value = null;
   logClosed = false;
   selectedIds.value.clear();
-  thinkingId.value = null;
+  gameSeq++; // 旧局的在途请求（大模型可能还在想）一律作废
+  armLlmAbort(); // 真的把旧请求掐掉，别让它继续烧 token
+  endThinking();
+  thoughts.value = {};
+  thoughtPid.value = null;
   paused = false;
   // 重开时清掉桌面残留（上一轮的牌 / PASS 覆盖 / 失败提示静默开关）
   lastRoundCards.value = [];
@@ -519,6 +667,8 @@ async function driveBots() {
   if (running) return;
   if (paused) return;
   if (!state.value) return;
+  // 没有超时之后，一次决策可能等很久；用局号判断「回来时是不是还是这一局」
+  const seq = gameSeq;
   running = true;
   try {
     for (let i = 0; i < 200; i++) {
@@ -527,9 +677,9 @@ async function driveBots() {
       if (paused) break;
       if (s.currentPlayerId === 0 || s.currentPlayerId == null) break;
 
-      thinkingId.value = s.currentPlayerId;
+      beginThinking(s.currentPlayerId);
       await sleep(550 + Math.random() * 500);
-      if (paused) break;
+      if (paused || seq !== gameSeq) break;
 
       const player = s.players[s.currentPlayerId];
       if (s.phase === "bidding") {
@@ -538,7 +688,7 @@ async function driveBots() {
         let reason = "";
         let source: "llm" | "rule" = "rule";
         if (shouldUseLlm(agentFor(player.id))) {
-          const out = await withLlmRetry(player.id, "抢地主", onErr =>
+          const out = await withLlmRetry(player.id, "抢地主", opts =>
             llmDdzBid(
               llmConfigFor(player.id),
               {
@@ -547,9 +697,10 @@ async function driveBots() {
                 prePersons: buildPrePersons(s),
                 persona: agentFor(player.id)?.persona,
               },
-              onErr
+              opts
             )
           );
+          if (seq !== gameSeq || paused) break; // 已重开/已离开 → 这次结果作废
           if (out) {
             source = "llm";
             reason = out.reason ?? "";
@@ -563,7 +714,6 @@ async function driveBots() {
             }
           }
         }
-        sfx.chip();
         doBid(player.id, score, { source, reason });
       } else {
         // 出牌阶段：引擎先枚举出**全部合法候选**，大模型与规则 AI 共用同一份。
@@ -587,12 +737,13 @@ async function driveBots() {
         if (shouldUseLlm(agentFor(player.id))) {
           let out: Awaited<ReturnType<typeof llmDdzDecision>> = null;
           try {
-            out = await withLlmRetry(player.id, "出牌", onErr =>
-              llmDdzDecision(llmConfigFor(player.id), buildDdzInput(s, player, choices, hint), onErr)
+            out = await withLlmRetry(player.id, "出牌", opts =>
+              llmDdzDecision(llmConfigFor(player.id), buildDdzInput(s, player, choices, hint), opts)
             );
           } catch {
             out = null;
           }
+          if (seq !== gameSeq || paused) break; // 已重开/已离开 → 这次结果作废
           if (out) {
             reason = out.reason ?? "";
             source = "llm";
@@ -622,20 +773,16 @@ async function driveBots() {
         }
 
         if (picked && picked.length) {
-          sfx.play();
           doPlay(player.id, picked.map(c => c.id), { source, reason });
         } else if (llmPass && s.lastPlay) {
           // 尊重 LLM 的「不出」（不压队友、保存实力）——不能被兜底覆盖
-          sfx.fold();
           doPass(player.id, { source: "llm", reason: reason || "选择不出" });
         } else {
           // 规则 AI：不再「有压就压最小的」，改用启发式评分从候选里选
           const cards = bestPlay(ctx);
           if (cards && cards.length) {
-            sfx.play();
             doPlay(player.id, cards.map(c => c.id), { source: "rule", reason: "规则 AI 选牌" });
           } else {
-            sfx.fold();
             doPass(player.id, { source: "rule", reason: "规则 AI 无牌可压" });
           }
         }
@@ -644,9 +791,16 @@ async function driveBots() {
   } finally {
     running = false;
   }
-  thinkingId.value = null;
+  // 换局时新局调用的 driveBots() 会因为 running 还是 true 直接 return，
+  // 所以旧循环退出时必须自己把新局接上，否则新局第一手永远没人推。
+  if (seq !== gameSeq) {
+    driveBots();
+    return;
+  }
+  endThinking();
 
-  if (state.value?.phase === "gameover") {
+  // 重开后旧局的结果不能再结算
+  if (seq === gameSeq && state.value?.phase === "gameover") {
     const win = iWin.value;
     finalizeMatch(win);
     win ? sfx.win() : sfx.lose();
@@ -698,7 +852,6 @@ function playSelected() {
   const ids = Array.from(selectedIds.value);
   if (ids.length === 0) return;
   busy.value = true;
-  sfx.play();
   doPlay(0, ids, { source: "human" });
   selectedIds.value.clear();
   resetHint();
@@ -709,7 +862,6 @@ function playSelected() {
 function pass() {
   if (!isMyTurn.value || busy.value) return;
   busy.value = true;
-  sfx.fold();
   doPass(0, { source: "human" });
   selectedIds.value.clear();
   resetHint();
@@ -720,7 +872,6 @@ function pass() {
 function bid(score: number) {
   if (!isMyTurn.value || !isBidding.value || busy.value) return;
   busy.value = true;
-  sfx.chip();
   doBid(0, score, { source: "human" });
   selectedIds.value.clear();
   busy.value = false;
@@ -871,11 +1022,29 @@ function positionLabel(i: number, n: number): string {
   return ["左", "对面", "右"][i] ?? "";
 }
 
-onMounted(maybeStart);
-onActivated(maybeStart);
+onMounted(() => {
+  startTick();
+  maybeStart();
+});
+onActivated(() => {
+  startTick();
+  maybeStart();
+});
 onDeactivated(() => {
   paused = true;
+  stopTick();
 });
+
+// 思考过程是流式追加的：弹层开着时自动滚到底
+watch(
+  () => (thoughtPid.value != null ? (thoughts.value[thoughtPid.value] ?? "") : ""),
+  () => {
+    nextTick(() => {
+      const el = thoughtBox.value;
+      if (el) el.scrollTop = el.scrollHeight;
+    });
+  }
+);
 </script>
 
 <template>
@@ -968,7 +1137,10 @@ onDeactivated(() => {
               :is-current="thinkingId === p.id"
               :conn="connFor(p.id)"
               :passed="passFlags[p.id] ?? false"
+              :thoughts="thoughts[p.id] ?? ''"
+              :waited="thinkingId === p.id ? waitedSec : 0"
               @edit-model="openModelEditor(p.id)"
+              @open-thoughts="openThoughts(p.id)"
             />
           </div>
           <!-- 中央区：需压过的牌（上移到牌桌中上部，底牌消失后的空位正好给它用） -->
@@ -1288,6 +1460,44 @@ onDeactivated(() => {
         </div>
       </div>
     </div>
+    <!-- 思考过程弹层：流式实时刷新（关闭后可从座位上点「›」再看） -->
+    <div
+      v-if="thoughtPid != null"
+      class="absolute inset-0 z-[66] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+      @click.self="thoughtPid = null"
+    >
+      <div
+        class="flex max-h-[80vh] w-[640px] max-w-[94vw] flex-col rounded-2xl border border-violet-400/50 bg-gradient-to-b from-slate-800 to-slate-900 p-5 shadow-2xl"
+      >
+        <div class="mb-2 flex items-center justify-between gap-3">
+          <div class="flex min-w-0 items-center gap-2">
+            <span class="text-lg">🧠</span>
+            <span class="truncate text-sm font-black text-violet-200">
+              {{ thoughtPlayer?.name ?? "AI 对手" }} 的思考过程
+            </span>
+            <span
+              v-if="thinkingId === thoughtPid"
+              class="shrink-0 rounded-full bg-amber-500/25 px-2 py-0.5 text-[10px] font-bold text-amber-200"
+            >
+              思考中 · 已等 {{ waitedSec }}s
+            </span>
+          </div>
+          <button class="btn-ghost shrink-0 rounded-lg px-2 py-1 text-xs" @click="thoughtPid = null">
+            关闭
+          </button>
+        </div>
+        <div
+          ref="thoughtBox"
+          class="min-h-[90px] flex-1 overflow-y-auto whitespace-pre-wrap break-words rounded-xl border border-white/10 bg-black/45 p-3 text-[12px] leading-relaxed text-white/85"
+        >
+          {{ currentThought || "（该模型没有返回 reasoning_content，或还没开始思考）" }}
+        </div>
+        <div class="mt-2 text-[11px] text-white/40">
+          这段是模型边想边流回来的 reasoning_content；关掉弹层后，座位上仍留「›」入口可回看。
+        </div>
+      </div>
+    </div>
+
     <!-- 出牌过程中：某个 agent 的大模型调用失败 → 可重试，或交给规则引擎 -->
     <div
       v-if="llmFail"
